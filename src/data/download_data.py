@@ -307,7 +307,13 @@ def download_gpm(cfg, start_override=None, end_override=None,
 
 
 def _verify_hdf5_content(fpath: Path):
-    """Open the file with h5py and print key metadata to confirm it's genuine GPM data."""
+    """
+    Open the file with h5py and print key metadata to confirm genuine GPM IMERG V07B data.
+
+    V07B structure (changed from V06):
+      Dataset name : /Grid/precipitation  (V06 used precipitationCal)
+      Axis order   : (time, lat, lon)     (V06 used (time, lon, lat))
+    """
     try:
         import h5py
     except ImportError:
@@ -315,21 +321,37 @@ def _verify_hdf5_content(fpath: Path):
         return
 
     with h5py.File(fpath, "r") as hf:
-        grp = hf["Grid"]
+        grp   = hf["Grid"]
         lats  = grp["lat"][:]
         lons  = grp["lon"][:]
-        precip = grp["precipitationCal"][:]
-        t_sec  = int(grp["time"][0])
+        t_sec = int(grp["time"][0])
+
+        # V07B uses "precipitation"; V06 used "precipitationCal" — try both
+        if "precipitation" in grp:
+            precip = grp["precipitation"][:]
+            ds_name = "precipitation"
+        elif "precipitationCal" in grp:
+            precip = grp["precipitationCal"][:]
+            ds_name = "precipitationCal"
+        else:
+            available = list(grp.keys())
+            log.warning("  Neither precipitation nor precipitationCal found. Keys: %s", available)
+            return
 
     import datetime as dt_mod
-    ts = dt_mod.datetime.fromtimestamp(t_sec, tz=dt_mod.timezone.utc)
+    ts    = dt_mod.datetime.fromtimestamp(t_sec, tz=dt_mod.timezone.utc)
+    valid = precip[precip > -9000]
     log.info("  HDF5 content verification:")
-    log.info("    Timestamp  : %s UTC", ts)
-    log.info("    Global lat : %.1f to %.1f  (%d pts)", lats.min(), lats.max(), len(lats))
-    log.info("    Global lon : %.1f to %.1f  (%d pts)", lons.min(), lons.max(), len(lons))
+    log.info("    Timestamp   : %s UTC", ts)
+    log.info("    Dataset     : %s", ds_name)
+    log.info("    Global lat  : %.1f to %.1f  (%d pts)", lats.min(), lats.max(), len(lats))
+    log.info("    Global lon  : %.1f to %.1f  (%d pts)", lons.min(), lons.max(), len(lons))
     log.info("    Precip shape: %s  dtype=%s", precip.shape, precip.dtype)
-    log.info("    Precip range: %.3f to %.3f mm/hr", float(precip[precip > -9000].min()), float(precip.max()))
-    log.info("  ✓ Genuine GPM IMERG V07 HDF5 confirmed")
+    log.info("    Precip range: %.3f to %.3f mm/hr (valid pixels: %d)",
+             float(valid.min()) if valid.size else 0,
+             float(valid.max()) if valid.size else 0,
+             valid.size)
+    log.info("  ✓ Genuine GPM IMERG V07B HDF5 confirmed")
 
 
 # ---------------------------------------------------------------------------

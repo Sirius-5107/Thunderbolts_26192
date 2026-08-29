@@ -45,18 +45,24 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):
     """
-    Read one GPM IMERG HDF5 file, subset to bbox, return DataFrame.
+    Read one GPM IMERG V07B HDF5 file, subset to bbox, return DataFrame.
+
+    V07B structure (differs from V06):
+      Dataset : /Grid/precipitation        (V06: /Grid/precipitationCal)
+      Axes    : (time, lat, lon)  shape (1, 1800, 3600)
+                (V06 was (time, lon, lat))
+      Units   : mm/hr (instantaneous rate at 30-min window centre)
+      Fill    : -9999.9
 
     Returns columns: timestamp, latitude, longitude, precip_mm_hr
-    precipitationCal units: mm/hr  (half-hourly accumulation rate)
     """
     import h5py
     with h5py.File(fpath, "r") as hf:
         grp = hf["Grid"]
 
         # Coordinates — global 0.1-deg grid
-        lats = grp["lat"][:]     # shape (1800,)
-        lons = grp["lon"][:]     # shape (3600,)
+        lats = grp["lat"][:]   # shape (1800,)  south->north
+        lons = grp["lon"][:]   # shape (3600,)  west->east
 
         # Spatial mask
         lat_idx = np.where((lats >= lat_min) & (lats <= lat_max))[0]
@@ -66,13 +72,29 @@ def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):
             log.warning("No grid points in bbox for %s", fpath.name)
             return None
 
-        # Precipitation: shape (time, lon, lat) in V07
-        # Slice: [time_idx, lon_idx_min:lon_idx_max+1, lat_idx_min:lat_idx_max+1]
-        precip_raw = grp["precipitationCal"][
-            0,
-            lon_idx[0]:lon_idx[-1] + 1,
-            lat_idx[0]:lat_idx[-1] + 1,
-        ]  # shape (n_lon, n_lat)
+        # V07B dataset name and axis order: (time, lat, lon)
+        if "precipitation" in grp:
+            ds_name = "precipitation"
+        elif "precipitationCal" in grp:
+            ds_name = "precipitationCal"   # V06 fallback
+        else:
+            log.error("No precipitation dataset in %s. Keys: %s", fpath.name, list(grp.keys()))
+            return None
+
+        ds = grp[ds_name]
+        # Detect axis order from shape: V07B=(1,1800,3600), V06=(1,3600,1800)
+        if ds.shape[1] == 1800:
+            # V07B: (time, lat, lon) -> slice [0, lat_idx, lon_idx]
+            precip_raw = ds[0,
+                            lat_idx[0]:lat_idx[-1] + 1,
+                            lon_idx[0]:lon_idx[-1] + 1]  # (n_lat, n_lon)
+            axis_order = "time,lat,lon"
+        else:
+            # V06: (time, lon, lat) -> slice [0, lon_idx, lat_idx]
+            precip_raw = ds[0,
+                            lon_idx[0]:lon_idx[-1] + 1,
+                            lat_idx[0]:lat_idx[-1] + 1]  # (n_lon, n_lat)
+            axis_order = "time,lon,lat"
 
         # Timestamp: seconds since 1970-01-01 UTC
         t_sec = int(grp["time"][0])
@@ -82,10 +104,14 @@ def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):
         sub_lons = lons[lon_idx]
 
     # Build long-format DataFrame
-    lon_grid, lat_grid = np.meshgrid(sub_lons, sub_lats, indexing="ij")
-    precip_vals = precip_raw.flatten().astype(np.float32)
+    if axis_order == "time,lat,lon":
+        # precip_raw shape: (n_lat, n_lon) — meshgrid to align
+        lat_grid, lon_grid = np.meshgrid(sub_lats, sub_lons, indexing="ij")
+    else:
+        # precip_raw shape: (n_lon, n_lat)
+        lon_grid, lat_grid = np.meshgrid(sub_lons, sub_lats, indexing="ij")
 
-    # IMERG fill value is -9999.9
+    precip_vals = precip_raw.flatten().astype(np.float32)
     precip_vals[precip_vals < -9000] = np.nan
 
     df = pd.DataFrame({
