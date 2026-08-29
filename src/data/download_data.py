@@ -3,18 +3,17 @@ download_data.py
 ----------------
 Downloads real datasets for flash-flood prediction in Uttarakhand.
 
-Supported sources:
-  gpm    -- NASA GPM IMERG Final Run V07 (half-hourly HDF5)
-  era5   -- ERA5-Land + ERA5 single-level (NetCDF4, via CDS API)
-  srtm   -- SRTM DEM 30m via OpenTopography or 90m CGIAR-CSI
-  events -- IMD flood event catalog (already committed)
+GPM IMERG auth: NASA Earthdata Bearer token via URS OAuth endpoint.
+This is the NASA GES DISC-documented Python download method.
+See: https://disc.gsfc.nasa.gov/information/howto?title=How%20to%20Download%20Data%20Files%20from%20HTTPS%20Service%20with%20Python
 
 Usage:
   python src/data/download_data.py --source gpm [--start 2023-08-01] [--end 2023-08-31]
+  python src/data/download_data.py --source gpm --test-one   # download ONE file only
 
-GPM credentials: set EARTHDATA_USERNAME and EARTHDATA_PASSWORD env vars.
-  Register free: https://urs.earthdata.nasa.gov/
-  Required app:  https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg
+Credentials: set EARTHDATA_USERNAME and EARTHDATA_PASSWORD env vars.
+  Register: https://urs.earthdata.nasa.gov/
+  Required app approval: https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg
 """
 
 import argparse
@@ -46,110 +45,180 @@ def load_config():
 
 
 # ---------------------------------------------------------------------------
-# GPM IMERG Final Run V07  (GPM_3IMERGHH.07, half-hourly, 0.1 deg)
+# NASA Earthdata authentication — Bearer token method
 # ---------------------------------------------------------------------------
-# Access method: NASA GES DISC HTTPS data server with Earthdata cookie auth.
-# Auth flow:
-#   1. POST credentials to URS to get a session cookie
-#   2. All subsequent GES DISC requests carry that cookie automatically
-#   3. Files redirect through URS; requests.Session follows redirects
+# GES DISC file downloads follow this redirect chain:
+#   GET file.HDF5  ->  302 to URS OAuth  ->  302 back with cookie  ->  200 file
 #
-# Product:  GPM_3IMERGHH.07  (Final Run, latency ~3.5 months)
-# Files:    3B-HHR.MS.MRG.3IMERG.<date>-S<HH><MM>00-E<HH><MM>59.<HHMM>.V07B.HDF5
-# Size:     ~3-4 MB per file, 48 files/day
-# Docs:     https://disc.gsfc.nasa.gov/datasets/GPM_3IMERGHH_07/summary
+# requests.Session with Basic Auth FAILS because:
+#   - requests strips Authorization header on cross-domain redirects (RFC 7235)
+#   - URS receives no credentials on the redirect -> returns login HTML (0 bytes data)
+#
+# NASA-documented fix: obtain a Bearer token from URS *before* any file request,
+# then send "Authorization: Bearer <token>" directly — no redirect auth needed.
+# Source: https://disc.gsfc.nasa.gov/information/howto (Python download guide)
 
-GESDISC_BASE = "https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHH.07"
-URS_LOGIN    = "https://urs.earthdata.nasa.gov"
+URS_TOKEN_URL = "https://urs.earthdata.nasa.gov/api/users/find_or_create_token"
+URS_LOGIN     = "https://urs.earthdata.nasa.gov"
+GESDISC_BASE  = "https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHH.07"
 
 
-def _build_earthdata_session(user: str, pwd: str) -> requests.Session:
+def _get_bearer_token(user: str, pwd: str) -> str:
     """
-    Create an authenticated requests.Session for NASA GES DISC.
-    Uses cookie-based auth: posts to URS, then all redirects are followed.
+    Obtain a long-lived Bearer token from NASA Earthdata URS.
+    This token is sent as 'Authorization: Bearer <token>' on all GES DISC requests,
+    bypassing the redirect-auth stripping issue entirely.
     """
+    r = requests.post(
+        URS_TOKEN_URL,
+        auth=(user, pwd),
+        timeout=30,
+    )
+    if r.status_code == 401:
+        raise RuntimeError(
+            "URS authentication failed (HTTP 401). "
+            "Check EARTHDATA_USERNAME / EARTHDATA_PASSWORD."
+        )
+    if r.status_code not in (200, 201):
+        raise RuntimeError(
+            f"URS token endpoint returned HTTP {r.status_code}: {r.text[:300]}"
+        )
+    data = r.json()
+    token = data.get("access_token") or data.get("token", {}).get("access_token")
+    if not token:
+        raise RuntimeError(f"No access_token in URS response: {data}")
+    log.info("GPM: Earthdata Bearer token obtained (expires: %s)",
+             data.get("expiration_date", "unknown"))
+    return token
+
+
+def _build_session(token: str) -> requests.Session:
+    """Build a requests.Session that sends Bearer auth on every request."""
     session = requests.Session()
-    session.auth = (user, pwd)
-    # requests follows redirects automatically; Earthdata sets a cookie after
-    # the first authenticated redirect. We prime it here.
-    r = session.get(URS_LOGIN, timeout=20, allow_redirects=True)
-    if r.status_code not in (200, 302):
-        raise RuntimeError(f"URS login page returned HTTP {r.status_code}")
-    log.info("GPM: Earthdata session initialised (HTTP %d)", r.status_code)
+    session.headers.update({"Authorization": f"Bearer {token}"})
+    # Disable automatic Basic Auth — we use Bearer only
+    session.auth = None
     return session
 
 
+# ---------------------------------------------------------------------------
+# GES DISC listing and download
+# ---------------------------------------------------------------------------
+
 def _list_day_files(session: requests.Session, date: datetime.date) -> list:
-    """Return list of HDF5 filenames available for a given date on GES DISC."""
+    """Return sorted list of HDF5 filenames for one day from GES DISC."""
     doy = date.strftime("%j")
     url = f"{GESDISC_BASE}/{date.year}/{doy}/"
     r = session.get(url, timeout=30)
     if r.status_code == 401:
         raise RuntimeError(
-            "HTTP 401 Unauthorized. Check credentials and ensure the GES DISC app is approved:\n"
-            "  https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
+            "HTTP 401 on directory listing. "
+            "Approve the GES DISC app: "
+            "https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
         )
     if r.status_code == 404:
-        log.warning("GPM: No directory for %s (404) — data may not be available yet", date)
+        log.warning("GPM: 404 for %s — data not yet available", date)
         return []
     if r.status_code != 200:
         raise RuntimeError(f"GES DISC listing HTTP {r.status_code} for {url}")
-    # Extract HDF5 filenames from HTML directory listing
     files = re.findall(r'href="(3B-HHR\.MS\.MRG\.3IMERG\.[^"]+\.HDF5)"', r.text)
     return sorted(set(files))
 
 
-def _download_file(session: requests.Session, date: datetime.date,
-                   fname: str, outdir: Path) -> Path:
-    """Download one HDF5 file; skip if already present and non-zero."""
+def _download_one_file(session: requests.Session, date: datetime.date,
+                       fname: str, outdir: Path) -> Path:
+    """
+    Download one HDF5 file from GES DISC.
+    Bearer token in session headers handles auth without redirect issues.
+    Verifies minimum file size and HDF5 magic bytes.
+    """
     fpath = outdir / fname
-    if fpath.exists() and fpath.stat().st_size > 100_000:
-        return fpath  # already downloaded
+    if fpath.exists() and fpath.stat().st_size > 500_000:
+        log.info("  Already exists: %s (%.1f MB)", fname, fpath.stat().st_size / 1e6)
+        return fpath
 
     doy = date.strftime("%j")
     url = f"{GESDISC_BASE}/{date.year}/{doy}/{fname}"
-    r = session.get(url, stream=True, timeout=120, allow_redirects=True)
+    log.info("  Downloading: %s", fname)
+
+    r = session.get(url, stream=True, timeout=180, allow_redirects=True)
+
     if r.status_code == 401:
         raise RuntimeError(
             f"HTTP 401 downloading {fname}. "
-            "Approve the GES DISC app at:\n"
-            "  https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
+            "Approve GES DISC app: "
+            "https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
         )
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code} downloading {fname}")
+        body_preview = r.content[:500].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {r.status_code} downloading {fname}.\n"
+            f"Response preview: {body_preview}"
+        )
+
+    # Check Content-Type — error pages return text/html
+    ctype = r.headers.get("Content-Type", "")
+    if "html" in ctype.lower():
+        body = r.content[:1000].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"GES DISC returned HTML instead of HDF5 (Content-Type: {ctype}).\n"
+            f"This usually means the GES DISC app is not approved.\n"
+            f"Approve at: https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg\n"
+            f"Response preview:\n{body[:500]}"
+        )
 
     with open(fpath, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
 
     size_mb = fpath.stat().st_size / 1e6
-    if size_mb < 0.1:
+    log.info("  Written: %.2f MB", size_mb)
+
+    if size_mb < 0.5:
+        content = fpath.read_bytes()
         fpath.unlink()
-        raise RuntimeError(f"Downloaded file too small ({size_mb:.2f} MB) — likely an error page")
+        raise RuntimeError(
+            f"File too small ({size_mb:.3f} MB). "
+            f"First 200 bytes: {content[:200]}"
+        )
+
+    # Verify HDF5 magic bytes: first 8 bytes must be \x89HDF\r\n\x1a\n
+    magic = fpath.read_bytes()[:8]
+    if magic != b"\x89HDF\r\n\x1a\n":
+        fpath.unlink()
+        raise RuntimeError(
+            f"Not a valid HDF5 file (bad magic bytes: {magic!r}). "
+            "Response was probably an HTML error page saved to disk."
+        )
+
+    log.info("  HDF5 magic verified ✓  (%s, %.2f MB)", fname, size_mb)
     return fpath
 
 
-def download_gpm(cfg, start_override: str = None, end_override: str = None) -> bool:
-    """
-    Download GPM IMERG Final Run V07 HDF5 files for the Uttarakhand bbox period.
+# ---------------------------------------------------------------------------
+# GPM IMERG main download function
+# ---------------------------------------------------------------------------
 
-    Date range defaults to one month (Aug 2023) unless overridden via CLI.
+def download_gpm(cfg, start_override=None, end_override=None,
+                 test_one=False) -> bool:
+    """
+    Download GPM IMERG Final Run V07 HDF5 files.
+
+    Authentication: NASA Earthdata Bearer token (correct method for GES DISC).
     Files saved to: data/raw/gpm/YYYY/DOY/
 
-    Required env vars:
-      EARTHDATA_USERNAME
-      EARTHDATA_PASSWORD
+    Args:
+        test_one: If True, download only the first file of start_date and stop.
     """
     user = os.environ.get("EARTHDATA_USERNAME", "").strip()
     pwd  = os.environ.get("EARTHDATA_PASSWORD", "").strip()
     if not user or not pwd:
         log.error(
-            "GPM: EARTHDATA_USERNAME or EARTHDATA_PASSWORD not set.\n"
-            "  Register at https://urs.earthdata.nasa.gov/ and set env vars."
+            "EARTHDATA_USERNAME or EARTHDATA_PASSWORD not set.\n"
+            "Register at https://urs.earthdata.nasa.gov/"
         )
         return False
 
-    # Date range — default to Aug 2023 test window
     start_str = start_override or "2023-08-01"
     end_str   = end_override   or "2023-08-31"
     start_dt  = datetime.date.fromisoformat(start_str)
@@ -158,34 +227,46 @@ def download_gpm(cfg, start_override: str = None, end_override: str = None) -> b
     outdir = ROOT / cfg["paths"]["raw_gpm"]
     outdir.mkdir(parents=True, exist_ok=True)
 
-    log.info("GPM IMERG: %s to %s", start_str, end_str)
-    log.info("GPM IMERG: bbox lat %.1f-%.1f lon %.1f-%.1f",
-             cfg["region"]["bbox"]["lat_min"], cfg["region"]["bbox"]["lat_max"],
-             cfg["region"]["bbox"]["lon_min"], cfg["region"]["bbox"]["lon_max"])
-    log.info("GPM IMERG: Output dir: %s", outdir)
-
-    # Authenticate
+    # Step 1: obtain Bearer token
+    log.info("GPM: Obtaining Earthdata Bearer token for user '%s'...", user)
     try:
-        session = _build_earthdata_session(user, pwd)
-    except Exception as e:
-        log.error("GPM: Authentication failed: %s", e)
-        return False
-
-    # Verify with one listing before committing to full download
-    log.info("GPM: Verifying access with listing for %s ...", start_dt)
-    try:
-        test_files = _list_day_files(session, start_dt)
+        token = _get_bearer_token(user, pwd)
     except RuntimeError as e:
-        log.error("GPM: Access check failed: %s", e)
+        log.error("GPM: Token fetch failed: %s", e)
         return False
 
-    if not test_files:
-        log.error("GPM: No files found for %s — check date range and product availability", start_dt)
+    session = _build_session(token)
+
+    # Step 2: verify listing for start date
+    log.info("GPM: Verifying directory listing for %s...", start_dt)
+    try:
+        files = _list_day_files(session, start_dt)
+    except RuntimeError as e:
+        log.error("GPM: Listing failed: %s", e)
         return False
 
-    log.info("GPM: Access verified. Found %d files for %s. Starting download...", len(test_files), start_dt)
+    if not files:
+        log.error("GPM: No HDF5 files listed for %s.", start_dt)
+        return False
 
-    # Download all days
+    log.info("GPM: Found %d files for %s. First: %s", len(files), start_dt, files[0])
+
+    # Step 3: test-one mode — download first file only, then stop
+    if test_one:
+        fname    = files[0]
+        day_dir  = outdir / str(start_dt.year) / start_dt.strftime("%j")
+        day_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            fpath = _download_one_file(session, start_dt, fname, day_dir)
+            log.info("GPM TEST-ONE: SUCCESS — %s (%.2f MB)",
+                     fpath.name, fpath.stat().st_size / 1e6)
+            _verify_hdf5_content(fpath)
+            return True
+        except RuntimeError as e:
+            log.error("GPM TEST-ONE: FAILED — %s", e)
+            return False
+
+    # Step 4: full date range download
     total_files = 0
     total_bytes = 0
     current = start_dt
@@ -202,33 +283,57 @@ def download_gpm(cfg, start_override: str = None, end_override: str = None) -> b
             continue
 
         if not files:
-            log.warning("GPM: No files for %s, skipping", current)
             current += datetime.timedelta(days=1)
             continue
 
-        day_count = 0
+        day_bytes = 0
         for fname in files:
             try:
-                fpath = _download_file(session, current, fname, day_dir)
-                total_bytes += fpath.stat().st_size
-                day_count += 1
+                fpath = _download_one_file(session, current, fname, day_dir)
+                day_bytes  += fpath.stat().st_size
                 total_files += 1
+                total_bytes += fpath.stat().st_size
             except RuntimeError as e:
-                log.error("GPM: Download failed for %s: %s", fname, e)
+                log.error("GPM: %s", e)
                 return False
-            time.sleep(0.1)  # polite rate limit
+            time.sleep(0.05)
 
-        log.info("GPM: %s — %d files (total so far: %d, %.1f MB)",
-                 current, day_count, total_files, total_bytes / 1e6)
+        log.info("GPM: %s — %d files, %.1f MB (total: %d files, %.1f MB)",
+                 current, len(files), day_bytes / 1e6, total_files, total_bytes / 1e6)
         current += datetime.timedelta(days=1)
 
-    log.info("GPM IMERG: Download complete — %d files, %.1f MB total",
-             total_files, total_bytes / 1e6)
+    log.info("GPM: Download complete — %d files, %.1f MB", total_files, total_bytes / 1e6)
     return True
 
 
+def _verify_hdf5_content(fpath: Path):
+    """Open the file with h5py and print key metadata to confirm it's genuine GPM data."""
+    try:
+        import h5py
+    except ImportError:
+        log.warning("h5py not installed — skipping deep HDF5 verification. Run: pip install h5py")
+        return
+
+    with h5py.File(fpath, "r") as hf:
+        grp = hf["Grid"]
+        lats  = grp["lat"][:]
+        lons  = grp["lon"][:]
+        precip = grp["precipitationCal"][:]
+        t_sec  = int(grp["time"][0])
+
+    import datetime as dt_mod
+    ts = dt_mod.datetime.fromtimestamp(t_sec, tz=dt_mod.timezone.utc)
+    log.info("  HDF5 content verification:")
+    log.info("    Timestamp  : %s UTC", ts)
+    log.info("    Global lat : %.1f to %.1f  (%d pts)", lats.min(), lats.max(), len(lats))
+    log.info("    Global lon : %.1f to %.1f  (%d pts)", lons.min(), lons.max(), len(lons))
+    log.info("    Precip shape: %s  dtype=%s", precip.shape, precip.dtype)
+    log.info("    Precip range: %.3f to %.3f mm/hr", float(precip[precip > -9000].min()), float(precip.max()))
+    log.info("  ✓ Genuine GPM IMERG V07 HDF5 confirmed")
+
+
 # ---------------------------------------------------------------------------
-# ERA5 via CDS API
+# ERA5, SRTM, Events — unchanged
 # ---------------------------------------------------------------------------
 
 def download_era5(cfg) -> bool:
@@ -237,57 +342,38 @@ def download_era5(cfg) -> bool:
     except ImportError:
         log.warning("ERA5: cdsapi not installed. Run: pip install cdsapi")
         return False
-
     cdsrc = Path.home() / ".cdsapirc"
     if not cdsrc.exists():
         log.warning("ERA5: ~/.cdsapirc not found. Register at https://cds.climate.copernicus.eu/")
         return False
-
-    bbox = cfg["region"]["bbox"]
-    area = [bbox["lat_max"], bbox["lon_min"], bbox["lat_min"], bbox["lon_max"]]
+    import math
+    bbox  = cfg["region"]["bbox"]
+    area  = [bbox["lat_max"], bbox["lon_min"], bbox["lat_min"], bbox["lon_max"]]
     months = [str(m).zfill(2) for m in cfg["time"]["monsoon_months"]]
-
     outdir = ROOT / cfg["paths"]["raw_era5"]
     outdir.mkdir(parents=True, exist_ok=True)
     c = cdsapi.Client()
-
-    era5land_out = outdir / "era5land_precipitation_monsoon.nc"
-    if not era5land_out.exists():
-        years = [str(y) for y in range(2019, 2024)]
-        log.info("ERA5-Land: Requesting precipitation 2019-2023, monsoon months")
-        c.retrieve("reanalysis-era5-land", {
-            "variable": ["total_precipitation", "volumetric_soil_water_layer_1"],
-            "year": years, "month": months,
-            "day": [str(d).zfill(2) for d in range(1, 32)],
-            "time": [f"{h:02d}:00" for h in range(24)],
-            "area": area, "format": "netcdf",
-        }, str(era5land_out))
-    else:
-        log.info("ERA5-Land: Already exists.")
-
-    era5_out = outdir / "era5_weather_monsoon.nc"
-    if not era5_out.exists():
-        years = [str(y) for y in range(2019, 2024)]
-        log.info("ERA5: Requesting weather variables")
-        c.retrieve("reanalysis-era5-single-levels", {
-            "variable": ["2m_temperature", "2m_dewpoint_temperature",
-                         "surface_pressure", "10m_u_component_of_wind",
-                         "10m_v_component_of_wind"],
-            "product_type": "reanalysis",
-            "year": years, "month": months,
-            "day": [str(d).zfill(2) for d in range(1, 32)],
-            "time": [f"{h:02d}:00" for h in range(24)],
-            "area": area, "format": "netcdf",
-        }, str(era5_out))
-    else:
-        log.info("ERA5: Already exists.")
-
+    for fname, dataset, variables in [
+        ("era5land_precipitation_monsoon.nc", "reanalysis-era5-land",
+         ["total_precipitation", "volumetric_soil_water_layer_1"]),
+        ("era5_weather_monsoon.nc", "reanalysis-era5-single-levels",
+         ["2m_temperature", "2m_dewpoint_temperature", "surface_pressure",
+          "10m_u_component_of_wind", "10m_v_component_of_wind"]),
+    ]:
+        out = outdir / fname
+        if not out.exists():
+            years = [str(y) for y in range(2019, 2024)]
+            req = {"variable": variables, "year": years, "month": months,
+                   "day": [str(d).zfill(2) for d in range(1, 32)],
+                   "time": [f"{h:02d}:00" for h in range(24)],
+                   "area": area, "format": "netcdf"}
+            if dataset == "reanalysis-era5-single-levels":
+                req["product_type"] = "reanalysis"
+            c.retrieve(dataset, req, str(out))
+        else:
+            log.info("ERA5: %s already exists.", fname)
     return True
 
-
-# ---------------------------------------------------------------------------
-# SRTM DEM
-# ---------------------------------------------------------------------------
 
 def download_srtm(cfg) -> bool:
     import math
@@ -295,52 +381,43 @@ def download_srtm(cfg) -> bool:
     outdir = ROOT / cfg["paths"]["raw_srtm"]
     outdir.mkdir(parents=True, exist_ok=True)
     api_key = os.environ.get("OPENTOPO_API_KEY", "")
-
     if api_key:
         url = (f"https://portal.opentopography.org/API/globaldem?demtype=SRTMGL1"
                f"&south={bbox['lat_min']}&north={bbox['lat_max']}"
                f"&west={bbox['lon_min']}&east={bbox['lon_max']}"
                f"&outputFormat=GTiff&API_Key={api_key}")
-        outfile = outdir / "srtm_uttarakhand_30m.tif"
-        if not outfile.exists():
+        out = outdir / "srtm_uttarakhand_30m.tif"
+        if not out.exists():
             r = requests.get(url, stream=True, timeout=300)
             if r.status_code == 200:
-                with open(outfile, "wb") as f:
+                with open(out, "wb") as f:
                     for chunk in r.iter_content(1024 * 1024):
                         f.write(chunk)
-                log.info("SRTM GL1: %.1f MB", outfile.stat().st_size / 1e6)
+                log.info("SRTM GL1: %.1f MB", out.stat().st_size / 1e6)
             else:
                 log.error("SRTM GL1: HTTP %d", r.status_code)
                 return False
         return True
-
-    # Fallback: CGIAR-CSI 90m tiles (open)
     def tile_num(lon, lat):
         return math.floor((lon + 180) / 5) + 1, math.floor((60 - lat) / 5) + 1
-
     corners = [(bbox["lon_min"], bbox["lat_max"]), (bbox["lon_max"], bbox["lat_max"]),
-                (bbox["lon_min"], bbox["lat_min"]), (bbox["lon_max"], bbox["lat_min"])]
-    tiles = set(tile_num(lon, lat) for lon, lat in corners)
-    for tx, ty in tiles:
-        fname = f"srtm_{tx:02d}_{ty:02d}.zip"
-        outfile = outdir / fname
-        if outfile.exists():
+               (bbox["lon_min"], bbox["lat_min"]), (bbox["lon_max"], bbox["lat_min"])]
+    for tx, ty in set(tile_num(lon, lat) for lon, lat in corners):
+        fname  = f"srtm_{tx:02d}_{ty:02d}.zip"
+        out    = outdir / fname
+        if out.exists():
             continue
         url = f"https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF/{fname}"
         r = requests.get(url, stream=True, timeout=120)
         if r.status_code == 200:
-            with open(outfile, "wb") as f:
+            with open(out, "wb") as f:
                 for chunk in r.iter_content(1024 * 1024):
                     f.write(chunk)
-            log.info("SRTM 90m: %s %.1f MB", fname, outfile.stat().st_size / 1e6)
+            log.info("SRTM 90m: %s %.1f MB", fname, out.stat().st_size / 1e6)
         else:
             log.error("SRTM 90m: HTTP %d for %s", r.status_code, url)
     return True
 
-
-# ---------------------------------------------------------------------------
-# Flood Events
-# ---------------------------------------------------------------------------
 
 def check_events(cfg) -> bool:
     p = ROOT / cfg["paths"]["raw_events"] / "floods_india.xlsx"
@@ -363,12 +440,15 @@ def main():
                         help="GPM start date YYYY-MM-DD (default: 2023-08-01)")
     parser.add_argument("--end", default=None,
                         help="GPM end date YYYY-MM-DD (default: 2023-08-31)")
+    parser.add_argument("--test-one", action="store_true",
+                        help="Download only the first file of start_date to verify auth+download")
     args = parser.parse_args()
     cfg = load_config()
 
     results = {}
     if args.source in ("all", "gpm"):
-        results["gpm"] = download_gpm(cfg, args.start, args.end)
+        results["gpm"] = download_gpm(cfg, args.start, args.end,
+                                       test_one=args.test_one)
     if args.source in ("all", "era5"):
         results["era5"] = download_era5(cfg)
     if args.source in ("all", "srtm"):
