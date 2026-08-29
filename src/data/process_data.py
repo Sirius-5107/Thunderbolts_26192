@@ -128,29 +128,40 @@ def process_flood_events():
 # ---------------------------------------------------------------------------
 
 def process_gpm_rainfall():
-    gpm_dir = ROOT / CFG["paths"]["raw_gpm"]
-    nc_files = list(gpm_dir.rglob("*.nc4")) + list(gpm_dir.rglob("*.HDF5"))
-    if not nc_files:
-        log.warning("GPM IMERG: No files in %s. Will use synthetic data.", gpm_dir)
-        return None
-    try:
-        import xarray as xr
-        ds_list = []
-        for f in sorted(nc_files):
-            ds = xr.open_dataset(f, group="Grid")
-            ds = ds.sel(
-                lat=slice(BBOX["lat_min"], BBOX["lat_max"]),
-                lon=slice(BBOX["lon_min"], BBOX["lon_max"]),
-            )
-            ds_list.append(ds["precipitationCal"])
-        da = xr.concat(ds_list, dim="time")
-        result = da.to_dataframe(name="precip_mm_30min").reset_index()
-        result.to_parquet(OUT / "gpm_rainfall.parquet", index=False)
-        log.info("GPM IMERG: Processed %d files.", len(nc_files))
-        return result
-    except Exception as e:
-        log.error("GPM IMERG processing error: %s", e)
-        return None
+    """
+    If process_gpm.py has already produced gpm_rainfall.parquet, load it.
+    Otherwise attempt to run process_gpm.py if raw HDF5 files exist.
+    Returns the 3h rainfall DataFrame or None (falls back to synthetic).
+    """
+    gpm_parquet = OUT / "gpm_rainfall.parquet"
+    gpm_dir     = ROOT / CFG["paths"]["raw_gpm"]
+    hdf5_files  = list(gpm_dir.rglob("*.HDF5"))
+
+    # Case 1: processed parquet already exists
+    if gpm_parquet.exists():
+        log.info("GPM IMERG: Loading existing gpm_rainfall.parquet")
+        df = pd.read_parquet(gpm_parquet)
+        log.info("GPM IMERG: %d rows, %s to %s",
+                 len(df), df["timestamp"].min(), df["timestamp"].max())
+        return df
+
+    # Case 2: raw HDF5 present — run processor
+    if hdf5_files:
+        log.info("GPM IMERG: %d HDF5 files found. Running process_gpm.py...", len(hdf5_files))
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "src" / "data" / "process_gpm.py")],
+            capture_output=False,
+        )
+        if result.returncode == 0 and gpm_parquet.exists():
+            df = pd.read_parquet(gpm_parquet)
+            return df
+        else:
+            log.error("GPM IMERG: process_gpm.py failed.")
+            return None
+
+    log.warning("GPM IMERG: No HDF5 files in %s. Will use synthetic data.", gpm_dir)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -386,21 +397,31 @@ def main():
     era5_ok     = process_era5()
     terrain_ok  = process_srtm()
 
-    real_env = (rainfall_ok is not None) and (era5_ok is not None)
+    # Route: GPM available → real env grid. Neither → synthetic fallback.
+    gpm_env_out = OUT / "environmental_grid.parquet"
 
-    if not real_env:
-        log.info("Real environmental data unavailable. Generating synthetic data.")
+    if rainfall_ok is not None:
+        log.info("Building environmental_grid from real GPM data...")
+        env_df = rainfall_ok.rename(columns={"precip_3h_mm": "precip_3h_mm"}).copy()
+        env_df["temperature_2m_c"]  = float("nan")
+        env_df["humidity_pct"]       = float("nan")
+        env_df["pressure_hpa"]       = float("nan")
+        env_df["soil_moisture_m3m3"] = float("nan")
+        env_df["data_source"]        = "GPM_IMERG_V07"
+        env_df.to_parquet(gpm_env_out, index=False)
+        log.info("Environmental grid (GPM): %d rows -> %s", len(env_df), gpm_env_out.name)
+    elif not gpm_env_out.exists():
+        log.info("Real data unavailable. Generating synthetic data.")
         generate_synthetic_environmental_data(labels_df=labels_df)
         log.info(
             "\n*** SYNTHETIC DATA NOTICE ***\n"
             "Environmental data is SYNTHETIC (pipeline testing only).\n"
             "Set EARTHDATA_USERNAME/EARTHDATA_PASSWORD and run:\n"
             "  python src/data/download_data.py --source gpm\n"
-            "  python src/data/download_data.py --source era5\n"
             "Then re-run this script. Flood labels are REAL (IMD catalog)."
         )
     else:
-        log.info("Real environmental data processed.")
+        log.info("Environmental grid already exists, skipping regeneration.")
 
     log.info("Processing complete. Output: %s", OUT)
 

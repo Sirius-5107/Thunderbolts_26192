@@ -3,21 +3,25 @@ download_data.py
 ----------------
 Downloads real datasets for flash-flood prediction in Uttarakhand.
 
-Supported data:
-  1. NASA GPM IMERG (requires EARTHDATA_USERNAME / EARTHDATA_PASSWORD env vars)
-  2. ERA5-Land precipitation + weather (requires ~/.cdsapirc with CDS key)
-  3. SRTM DEM (requires OPENTOPO_API_KEY env var for 30m; 90m tile is open)
-  4. IMD Flood Event Catalog (already in data/raw/flood_events/)
+Supported sources:
+  gpm    -- NASA GPM IMERG Final Run V07 (half-hourly HDF5)
+  era5   -- ERA5-Land + ERA5 single-level (NetCDF4, via CDS API)
+  srtm   -- SRTM DEM 30m via OpenTopography or 90m CGIAR-CSI
+  events -- IMD flood event catalog (already committed)
 
 Usage:
-  python src/data/download_data.py [--source all|gpm|era5|srtm|events]
+  python src/data/download_data.py --source gpm [--start 2023-08-01] [--end 2023-08-31]
 
-If credentials are missing the script logs the limitation and skips that source.
+GPM credentials: set EARTHDATA_USERNAME and EARTHDATA_PASSWORD env vars.
+  Register free: https://urs.earthdata.nasa.gov/
+  Required app:  https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg
 """
 
 import argparse
+import datetime
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -42,120 +46,192 @@ def load_config():
 
 
 # ---------------------------------------------------------------------------
-# GPM IMERG
+# GPM IMERG Final Run V07  (GPM_3IMERGHH.07, half-hourly, 0.1 deg)
 # ---------------------------------------------------------------------------
+# Access method: NASA GES DISC HTTPS data server with Earthdata cookie auth.
+# Auth flow:
+#   1. POST credentials to URS to get a session cookie
+#   2. All subsequent GES DISC requests carry that cookie automatically
+#   3. Files redirect through URS; requests.Session follows redirects
+#
+# Product:  GPM_3IMERGHH.07  (Final Run, latency ~3.5 months)
+# Files:    3B-HHR.MS.MRG.3IMERG.<date>-S<HH><MM>00-E<HH><MM>59.<HHMM>.V07B.HDF5
+# Size:     ~3-4 MB per file, 48 files/day
+# Docs:     https://disc.gsfc.nasa.gov/datasets/GPM_3IMERGHH_07/summary
 
-def download_gpm(cfg):
+GESDISC_BASE = "https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHH.07"
+URS_LOGIN    = "https://urs.earthdata.nasa.gov"
+
+
+def _build_earthdata_session(user: str, pwd: str) -> requests.Session:
     """
-    Download NASA GPM IMERG Final Run V07 HDF5 files via GES DISC OPeNDAP.
-
-    Requires:
-      EARTHDATA_USERNAME and EARTHDATA_PASSWORD environment variables
-      (Register free at https://urs.earthdata.nasa.gov/)
-
-    Files land in data/raw/gpm/YYYY/MM/
+    Create an authenticated requests.Session for NASA GES DISC.
+    Uses cookie-based auth: posts to URS, then all redirects are followed.
     """
-    user = os.environ.get("EARTHDATA_USERNAME")
-    pwd = os.environ.get("EARTHDATA_PASSWORD")
+    session = requests.Session()
+    session.auth = (user, pwd)
+    # requests follows redirects automatically; Earthdata sets a cookie after
+    # the first authenticated redirect. We prime it here.
+    r = session.get(URS_LOGIN, timeout=20, allow_redirects=True)
+    if r.status_code not in (200, 302):
+        raise RuntimeError(f"URS login page returned HTTP {r.status_code}")
+    log.info("GPM: Earthdata session initialised (HTTP %d)", r.status_code)
+    return session
+
+
+def _list_day_files(session: requests.Session, date: datetime.date) -> list:
+    """Return list of HDF5 filenames available for a given date on GES DISC."""
+    doy = date.strftime("%j")
+    url = f"{GESDISC_BASE}/{date.year}/{doy}/"
+    r = session.get(url, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError(
+            "HTTP 401 Unauthorized. Check credentials and ensure the GES DISC app is approved:\n"
+            "  https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
+        )
+    if r.status_code == 404:
+        log.warning("GPM: No directory for %s (404) — data may not be available yet", date)
+        return []
+    if r.status_code != 200:
+        raise RuntimeError(f"GES DISC listing HTTP {r.status_code} for {url}")
+    # Extract HDF5 filenames from HTML directory listing
+    files = re.findall(r'href="(3B-HHR\.MS\.MRG\.3IMERG\.[^"]+\.HDF5)"', r.text)
+    return sorted(set(files))
+
+
+def _download_file(session: requests.Session, date: datetime.date,
+                   fname: str, outdir: Path) -> Path:
+    """Download one HDF5 file; skip if already present and non-zero."""
+    fpath = outdir / fname
+    if fpath.exists() and fpath.stat().st_size > 100_000:
+        return fpath  # already downloaded
+
+    doy = date.strftime("%j")
+    url = f"{GESDISC_BASE}/{date.year}/{doy}/{fname}"
+    r = session.get(url, stream=True, timeout=120, allow_redirects=True)
+    if r.status_code == 401:
+        raise RuntimeError(
+            f"HTTP 401 downloading {fname}. "
+            "Approve the GES DISC app at:\n"
+            "  https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} downloading {fname}")
+
+    with open(fpath, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            f.write(chunk)
+
+    size_mb = fpath.stat().st_size / 1e6
+    if size_mb < 0.1:
+        fpath.unlink()
+        raise RuntimeError(f"Downloaded file too small ({size_mb:.2f} MB) — likely an error page")
+    return fpath
+
+
+def download_gpm(cfg, start_override: str = None, end_override: str = None) -> bool:
+    """
+    Download GPM IMERG Final Run V07 HDF5 files for the Uttarakhand bbox period.
+
+    Date range defaults to one month (Aug 2023) unless overridden via CLI.
+    Files saved to: data/raw/gpm/YYYY/DOY/
+
+    Required env vars:
+      EARTHDATA_USERNAME
+      EARTHDATA_PASSWORD
+    """
+    user = os.environ.get("EARTHDATA_USERNAME", "").strip()
+    pwd  = os.environ.get("EARTHDATA_PASSWORD", "").strip()
     if not user or not pwd:
-        log.warning(
-            "GPM IMERG: EARTHDATA_USERNAME / EARTHDATA_PASSWORD not set. "
-            "Register at https://urs.earthdata.nasa.gov/ and set env vars."
+        log.error(
+            "GPM: EARTHDATA_USERNAME or EARTHDATA_PASSWORD not set.\n"
+            "  Register at https://urs.earthdata.nasa.gov/ and set env vars."
         )
         return False
 
-    bbox = cfg["region"]["bbox"]
-    start = cfg["time"]["start_date"]
-    end = cfg["time"]["end_date"]
+    # Date range — default to Aug 2023 test window
+    start_str = start_override or "2023-08-01"
+    end_str   = end_override   or "2023-08-31"
+    start_dt  = datetime.date.fromisoformat(start_str)
+    end_dt    = datetime.date.fromisoformat(end_str)
+
     outdir = ROOT / cfg["paths"]["raw_gpm"]
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # GES DISC OPeNDAP base URL for IMERG Final V07
-    # Half-hourly files; we aggregate in processing step
-    BASE_URL = (
-        "https://gpm1.gesdisc.eosdis.nasa.gov/opendap/GPM_L3/"
-        "GPM_3IMERGHH.07/{year}/{doy}/"
-        "3B-HHR.MS.MRG.3IMERG.{date}-S{hour}3000-E{hour}5959.{hhmm}.V07B.HDF5"
-    )
+    log.info("GPM IMERG: %s to %s", start_str, end_str)
+    log.info("GPM IMERG: bbox lat %.1f-%.1f lon %.1f-%.1f",
+             cfg["region"]["bbox"]["lat_min"], cfg["region"]["bbox"]["lat_max"],
+             cfg["region"]["bbox"]["lon_min"], cfg["region"]["bbox"]["lon_max"])
+    log.info("GPM IMERG: Output dir: %s", outdir)
 
-    log.info("GPM IMERG: Starting download for %s to %s", start, end)
-    log.info("GPM IMERG: Spatial subset bbox=%s", bbox)
-
-    # Download logic skeleton — real implementation requires date iteration
-    # and authenticated session via NASA Earthdata
-    session = requests.Session()
-    session.auth = (user, pwd)
-
-    # Example: download one day to verify credentials
-    import datetime
-    d = datetime.date.fromisoformat(start)
-    doy = d.strftime("%j").zfill(3)
-    url = (
-        f"https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHHL.07/"
-        f"{d.year}/{doy}/"
-    )
-    r = session.get(url, timeout=30)
-    if r.status_code == 200:
-        log.info("GPM IMERG: Credentials valid. Full download ready.")
-        log.info("GPM IMERG: Implement full loop using gesdisc_download_range() below.")
-    else:
-        log.error("GPM IMERG: HTTP %d. Check credentials.", r.status_code)
+    # Authenticate
+    try:
+        session = _build_earthdata_session(user, pwd)
+    except Exception as e:
+        log.error("GPM: Authentication failed: %s", e)
         return False
 
-    return True
+    # Verify with one listing before committing to full download
+    log.info("GPM: Verifying access with listing for %s ...", start_dt)
+    try:
+        test_files = _list_day_files(session, start_dt)
+    except RuntimeError as e:
+        log.error("GPM: Access check failed: %s", e)
+        return False
 
+    if not test_files:
+        log.error("GPM: No files found for %s — check date range and product availability", start_dt)
+        return False
 
-def gesdisc_download_range(session, start_date, end_date, bbox, outdir):
-    """Iterate dates, download 30-min IMERG HDF5, save to outdir/YYYY/MM/."""
-    import datetime
-    d = datetime.date.fromisoformat(start_date)
-    end = datetime.date.fromisoformat(end_date)
-    while d <= end:
-        year = d.year
-        doy = d.strftime("%j").zfill(3)
-        ydir = outdir / str(year) / d.strftime("%m")
-        ydir.mkdir(parents=True, exist_ok=True)
-        # Listing URL for the day's files
-        listing_url = (
-            f"https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/"
-            f"GPM_3IMERGHHL.07/{year}/{doy}/"
-        )
-        r = session.get(listing_url, timeout=30)
-        if r.status_code != 200:
-            log.warning("Could not list %s: HTTP %d", listing_url, r.status_code)
-            d += datetime.timedelta(days=1)
+    log.info("GPM: Access verified. Found %d files for %s. Starting download...", len(test_files), start_dt)
+
+    # Download all days
+    total_files = 0
+    total_bytes = 0
+    current = start_dt
+
+    while current <= end_dt:
+        day_dir = outdir / str(current.year) / current.strftime("%j")
+        day_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            files = _list_day_files(session, current)
+        except RuntimeError as e:
+            log.error("GPM: Listing failed for %s: %s", current, e)
+            current += datetime.timedelta(days=1)
             continue
-        # Parse filenames from directory listing HTML
-        import re
-        files = re.findall(r'href="(3B-HHR.*?\.HDF5)"', r.text)
+
+        if not files:
+            log.warning("GPM: No files for %s, skipping", current)
+            current += datetime.timedelta(days=1)
+            continue
+
+        day_count = 0
         for fname in files:
-            fpath = ydir / fname
-            if fpath.exists():
-                continue
-            dl_url = listing_url + fname
-            fr = session.get(dl_url, stream=True, timeout=120)
-            if fr.status_code == 200:
-                with open(fpath, "wb") as fh:
-                    for chunk in fr.iter_content(1024 * 1024):
-                        fh.write(chunk)
-                log.info("Downloaded %s", fname)
-            time.sleep(0.2)
-        d += datetime.timedelta(days=1)
+            try:
+                fpath = _download_file(session, current, fname, day_dir)
+                total_bytes += fpath.stat().st_size
+                day_count += 1
+                total_files += 1
+            except RuntimeError as e:
+                log.error("GPM: Download failed for %s: %s", fname, e)
+                return False
+            time.sleep(0.1)  # polite rate limit
+
+        log.info("GPM: %s — %d files (total so far: %d, %.1f MB)",
+                 current, day_count, total_files, total_bytes / 1e6)
+        current += datetime.timedelta(days=1)
+
+    log.info("GPM IMERG: Download complete — %d files, %.1f MB total",
+             total_files, total_bytes / 1e6)
+    return True
 
 
 # ---------------------------------------------------------------------------
 # ERA5 via CDS API
 # ---------------------------------------------------------------------------
 
-def download_era5(cfg):
-    """
-    Download ERA5-Land hourly precipitation and ERA5 surface weather via CDS API.
-
-    Requires ~/.cdsapirc with:
-      url: https://cds.climate.copernicus.eu/api/v2
-      key: <UID>:<API_KEY>
-    (Register free at https://cds.climate.copernicus.eu/)
-    """
+def download_era5(cfg) -> bool:
     try:
         import cdsapi
     except ImportError:
@@ -164,76 +240,47 @@ def download_era5(cfg):
 
     cdsrc = Path.home() / ".cdsapirc"
     if not cdsrc.exists():
-        log.warning(
-            "ERA5: ~/.cdsapirc not found. "
-            "Register at https://cds.climate.copernicus.eu/ and create ~/.cdsapirc"
-        )
+        log.warning("ERA5: ~/.cdsapirc not found. Register at https://cds.climate.copernicus.eu/")
         return False
 
     bbox = cfg["region"]["bbox"]
-    area = [
-        bbox["lat_max"], bbox["lon_min"],
-        bbox["lat_min"], bbox["lon_max"],
-    ]  # N, W, S, E for CDS
-
-    start_year = int(cfg["time"]["start_date"][:4])
-    end_year = int(cfg["time"]["end_date"][:4])
-    years = [str(y) for y in range(start_year, end_year + 1)]
+    area = [bbox["lat_max"], bbox["lon_min"], bbox["lat_min"], bbox["lon_max"]]
     months = [str(m).zfill(2) for m in cfg["time"]["monsoon_months"]]
 
     outdir = ROOT / cfg["paths"]["raw_era5"]
     outdir.mkdir(parents=True, exist_ok=True)
-
     c = cdsapi.Client()
 
-    # ERA5-Land: precipitation (tp) and soil moisture (swvl1)
     era5land_out = outdir / "era5land_precipitation_monsoon.nc"
     if not era5land_out.exists():
-        log.info("ERA5-Land: Requesting precipitation %s–%s, months %s", start_year, end_year, months)
-        c.retrieve(
-            "reanalysis-era5-land",
-            {
-                "variable": ["total_precipitation", "volumetric_soil_water_layer_1"],
-                "year": years,
-                "month": months,
-                "day": [str(d).zfill(2) for d in range(1, 32)],
-                "time": [f"{h:02d}:00" for h in range(24)],
-                "area": area,
-                "format": "netcdf",
-            },
-            str(era5land_out),
-        )
-        log.info("ERA5-Land: Saved to %s", era5land_out)
+        years = [str(y) for y in range(2019, 2024)]
+        log.info("ERA5-Land: Requesting precipitation 2019-2023, monsoon months")
+        c.retrieve("reanalysis-era5-land", {
+            "variable": ["total_precipitation", "volumetric_soil_water_layer_1"],
+            "year": years, "month": months,
+            "day": [str(d).zfill(2) for d in range(1, 32)],
+            "time": [f"{h:02d}:00" for h in range(24)],
+            "area": area, "format": "netcdf",
+        }, str(era5land_out))
     else:
-        log.info("ERA5-Land: Already exists, skipping.")
+        log.info("ERA5-Land: Already exists.")
 
-    # ERA5 single-level: temperature, humidity, pressure, wind
     era5_out = outdir / "era5_weather_monsoon.nc"
     if not era5_out.exists():
+        years = [str(y) for y in range(2019, 2024)]
         log.info("ERA5: Requesting weather variables")
-        c.retrieve(
-            "reanalysis-era5-single-levels",
-            {
-                "variable": [
-                    "2m_temperature",
-                    "2m_dewpoint_temperature",
-                    "surface_pressure",
-                    "10m_u_component_of_wind",
-                    "10m_v_component_of_wind",
-                ],
-                "product_type": "reanalysis",
-                "year": years,
-                "month": months,
-                "day": [str(d).zfill(2) for d in range(1, 32)],
-                "time": [f"{h:02d}:00" for h in range(24)],
-                "area": area,
-                "format": "netcdf",
-            },
-            str(era5_out),
-        )
-        log.info("ERA5: Saved to %s", era5_out)
+        c.retrieve("reanalysis-era5-single-levels", {
+            "variable": ["2m_temperature", "2m_dewpoint_temperature",
+                         "surface_pressure", "10m_u_component_of_wind",
+                         "10m_v_component_of_wind"],
+            "product_type": "reanalysis",
+            "year": years, "month": months,
+            "day": [str(d).zfill(2) for d in range(1, 32)],
+            "time": [f"{h:02d}:00" for h in range(24)],
+            "area": area, "format": "netcdf",
+        }, str(era5_out))
     else:
-        log.info("ERA5: Already exists, skipping.")
+        log.info("ERA5: Already exists.")
 
     return True
 
@@ -242,110 +289,66 @@ def download_era5(cfg):
 # SRTM DEM
 # ---------------------------------------------------------------------------
 
-def download_srtm(cfg):
-    """
-    Download SRTM DEM via OpenTopography API (30m) or CGIAR-CSI tiles (90m, open).
-
-    For 30m: Set OPENTOPO_API_KEY env var.
-      Register free at https://opentopography.org/
-
-    For 90m open tiles: No credentials needed.
-      Tiles downloaded from https://srtm.csi.cgiar.org/srtmdata/
-    """
-    bbox = cfg["region"]["bbox"]
+def download_srtm(cfg) -> bool:
+    import math
+    bbox   = cfg["region"]["bbox"]
     outdir = ROOT / cfg["paths"]["raw_srtm"]
     outdir.mkdir(parents=True, exist_ok=True)
-
-    api_key = os.environ.get("OPENTOPO_API_KEY")
+    api_key = os.environ.get("OPENTOPO_API_KEY", "")
 
     if api_key:
-        # OpenTopography SRTM GL1 (30m)
-        url = (
-            f"https://portal.opentopography.org/API/globaldem"
-            f"?demtype=SRTMGL1"
-            f"&south={bbox['lat_min']}&north={bbox['lat_max']}"
-            f"&west={bbox['lon_min']}&east={bbox['lon_max']}"
-            f"&outputFormat=GTiff"
-            f"&API_Key={api_key}"
-        )
+        url = (f"https://portal.opentopography.org/API/globaldem?demtype=SRTMGL1"
+               f"&south={bbox['lat_min']}&north={bbox['lat_max']}"
+               f"&west={bbox['lon_min']}&east={bbox['lon_max']}"
+               f"&outputFormat=GTiff&API_Key={api_key}")
         outfile = outdir / "srtm_uttarakhand_30m.tif"
         if not outfile.exists():
-            log.info("SRTM GL1: Downloading 30m DEM via OpenTopography...")
             r = requests.get(url, stream=True, timeout=300)
             if r.status_code == 200:
                 with open(outfile, "wb") as f:
                     for chunk in r.iter_content(1024 * 1024):
                         f.write(chunk)
-                log.info("SRTM GL1: Saved %s (%.1f MB)", outfile.name, outfile.stat().st_size / 1e6)
+                log.info("SRTM GL1: %.1f MB", outfile.stat().st_size / 1e6)
             else:
-                log.error("SRTM GL1: HTTP %d — %s", r.status_code, r.text[:200])
+                log.error("SRTM GL1: HTTP %d", r.status_code)
                 return False
-        else:
-            log.info("SRTM GL1: Already exists.")
         return True
-    else:
-        log.warning(
-            "OPENTOPO_API_KEY not set. Using SRTM 90m CGIAR-CSI tiles.\n"
-            "  Register at https://opentopography.org/ for 30m tiles.\n"
-            "  Downloading 90m tiles covering Uttarakhand bbox..."
-        )
-        return _download_srtm_cgiar(bbox, outdir)
 
-
-def _download_srtm_cgiar(bbox, outdir):
-    """Download SRTM 90m tiles from CGIAR-CSI."""
-    import math
-    # CGIAR tile numbering: lon tile = floor((lon+180)/5)+1, lat tile = floor((60-lat)/5)+1
+    # Fallback: CGIAR-CSI 90m tiles (open)
     def tile_num(lon, lat):
-        tx = math.floor((lon + 180) / 5) + 1
-        ty = math.floor((60 - lat) / 5) + 1
-        return tx, ty
+        return math.floor((lon + 180) / 5) + 1, math.floor((60 - lat) / 5) + 1
 
-    corners = [
-        (bbox["lon_min"], bbox["lat_max"]),
-        (bbox["lon_max"], bbox["lat_max"]),
-        (bbox["lon_min"], bbox["lat_min"]),
-        (bbox["lon_max"], bbox["lat_min"]),
-    ]
+    corners = [(bbox["lon_min"], bbox["lat_max"]), (bbox["lon_max"], bbox["lat_max"]),
+                (bbox["lon_min"], bbox["lat_min"]), (bbox["lon_max"], bbox["lat_min"])]
     tiles = set(tile_num(lon, lat) for lon, lat in corners)
-    log.info("SRTM 90m CGIAR: Tiles needed: %s", tiles)
-
     for tx, ty in tiles:
         fname = f"srtm_{tx:02d}_{ty:02d}.zip"
         outfile = outdir / fname
         if outfile.exists():
-            log.info("SRTM: %s already exists, skipping.", fname)
             continue
         url = f"https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF/{fname}"
-        log.info("SRTM 90m: Downloading tile %s...", fname)
         r = requests.get(url, stream=True, timeout=120)
         if r.status_code == 200:
             with open(outfile, "wb") as f:
                 for chunk in r.iter_content(1024 * 1024):
                     f.write(chunk)
-            log.info("SRTM 90m: Saved %s (%.1f MB)", fname, outfile.stat().st_size / 1e6)
+            log.info("SRTM 90m: %s %.1f MB", fname, outfile.stat().st_size / 1e6)
         else:
             log.error("SRTM 90m: HTTP %d for %s", r.status_code, url)
     return True
 
 
 # ---------------------------------------------------------------------------
-# IMD Flood Events (already downloaded)
+# Flood Events
 # ---------------------------------------------------------------------------
 
-def check_events(cfg):
-    events_file = ROOT / cfg["paths"]["raw_events"] / "floods_india.xlsx"
-    if events_file.exists():
-        log.info("Flood events catalog: %s (%.1f KB)", events_file.name, events_file.stat().st_size / 1e3)
+def check_events(cfg) -> bool:
+    p = ROOT / cfg["paths"]["raw_events"] / "floods_india.xlsx"
+    if p.exists():
+        log.info("Flood events: %s (%.0f KB)", p.name, p.stat().st_size / 1e3)
         return True
-    else:
-        log.warning(
-            "Flood events file not found: %s\n"
-            "Download from: https://raw.githubusercontent.com/"
-            "varadtrivedi/Analysing-Flood-Risk-in-India/main/floods.xlsx",
-            events_file,
-        )
-        return False
+    log.warning("Flood events file not found: %s", p)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -353,39 +356,30 @@ def check_events(cfg):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Download flash flood data sources")
-    parser.add_argument(
-        "--source",
-        default="all",
-        choices=["all", "gpm", "era5", "srtm", "events"],
-        help="Which data source to download",
-    )
+    parser = argparse.ArgumentParser(description="Download flash flood datasets")
+    parser.add_argument("--source", default="all",
+                        choices=["all", "gpm", "era5", "srtm", "events"])
+    parser.add_argument("--start", default=None,
+                        help="GPM start date YYYY-MM-DD (default: 2023-08-01)")
+    parser.add_argument("--end", default=None,
+                        help="GPM end date YYYY-MM-DD (default: 2023-08-31)")
     args = parser.parse_args()
-
     cfg = load_config()
+
     results = {}
-
     if args.source in ("all", "gpm"):
-        results["gpm"] = download_gpm(cfg)
-
+        results["gpm"] = download_gpm(cfg, args.start, args.end)
     if args.source in ("all", "era5"):
         results["era5"] = download_era5(cfg)
-
     if args.source in ("all", "srtm"):
         results["srtm"] = download_srtm(cfg)
-
     if args.source in ("all", "events"):
         results["events"] = check_events(cfg)
 
-    log.info("Download summary: %s", results)
     failed = [k for k, v in results.items() if not v]
+    log.info("Summary: %s", results)
     if failed:
-        log.warning(
-            "The following sources require credentials or manual setup: %s\n"
-            "See config/data_config.yaml for URLs and env var names.\n"
-            "The pipeline will use available data; run process_data.py to proceed.",
-            failed,
-        )
+        log.warning("Failed/skipped: %s", failed)
     return 0 if not failed else 1
 
 
