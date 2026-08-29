@@ -1,0 +1,39 @@
+# Credentials / secrets — never commit
+.env
+*.env
+.cdsapirc
+credentials.json
+*.key
+*.pem
+*.token
+secrets.yaml
+
+# Large raw datasets — regenerate via download_data.py
+data/raw/gpm/
+data/raw/era5/
+data/raw/srtm/
+
+# Large processed/feature files (regenerate via pipeline)
+data/processed/environmental_grid.parquet
+data/features/master_dataset.parquet
+data/validation_report.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/

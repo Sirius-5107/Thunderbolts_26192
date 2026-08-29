@@ -1,0 +1,82 @@
+# Flash Flood Prediction — Uttarakhand Study Region
+# SIH Problem 26192
+
+region:
+  name: "Uttarakhand Himalayan Region"
+  bbox:
+    lat_min: 28.5
+    lat_max: 31.5
+    lon_min: 77.5
+    lon_max: 81.0
+  grid_resolution_deg: 0.1   # ~11 km
+  elevation_range_m: [200, 7000]
+
+time:
+  start_date: "2001-01-01"
+  end_date: "2023-12-31"
+  temporal_resolution: "3H"
+  monsoon_months: [6, 7, 8, 9]
+
+data_sources:
+  rainfall:
+    primary:
+      name: "NASA GPM IMERG Final Run V07"
+      url: "https://gpm.nasa.gov/data/imerg"
+      access: "NASA Earthdata account required"
+      resolution_spatial: "0.1 deg"
+      resolution_temporal: "30min"
+      format: "HDF5"
+      auth_method: "NASA Earthdata credentials + OPeNDAP"
+      env_var: "EARTHDATA_USERNAME / EARTHDATA_PASSWORD"
+    fallback:
+      name: "ERA5-Land hourly precipitation"
+      url: "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land"
+      access: "Copernicus CDS account (free)"
+      resolution_spatial: "0.1 deg"
+      resolution_temporal: "1H"
+      format: "NetCDF4"
+      auth_method: "CDS API key in ~/.cdsapirc"
+      env_var: "CDS_API_KEY"
+
+  terrain:
+    primary:
+      name: "NASA SRTM GL1 (30m)"
+      url: "https://portal.opentopography.org/API/globaldem"
+      access: "OpenTopography API key (free, register at opentopography.org)"
+      resolution_spatial: "30m"
+      format: "GeoTIFF"
+      env_var: "OPENTOPO_API_KEY"
+    fallback:
+      name: "SRTM GL3 (90m) — CGIAR-CSI"
+      url: "https://srtm.csi.cgiar.org/srtmdata/"
+      access: "Open download, no auth"
+
+  weather:
+    name: "ERA5 single-level reanalysis"
+    url: "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels"
+    variables:
+      - temperature_2m
+      - dewpoint_2m
+      - surface_pressure
+      - u10
+      - v10
+      - volumetric_soil_water_layer_1
+    access: "Same CDS API key"
+
+  flood_events:
+    name: "IMD Flood Event Catalog (via NDMA)"
+    file: "data/raw/flood_events/floods_india.xlsx"
+    source_repo: "varadtrivedi/Analysing-Flood-Risk-in-India"
+    coverage: "1967-2023, all India states"
+
+paths:
+  raw_gpm: "data/raw/gpm"
+  raw_era5: "data/raw/era5"
+  raw_srtm: "data/raw/srtm"
+  raw_events: "data/raw/flood_events"
+  processed: "data/processed"
+  features: "data/features"
+
+output:
+  master_dataset: "data/features/master_dataset.parquet"
+  validation_report: "data/validation_report.json"
