@@ -14,8 +14,7 @@ Steps:
 
 Output:
   data/processed/flood_labels.parquet
-  data/processed/rainfall_grid.parquet
-  data/processed/weather_grid.parquet
+  data/processed/environmental_grid.parquet
   data/processed/terrain_grid.parquet
 """
 
@@ -38,13 +37,14 @@ ROOT = Path(__file__).resolve().parents[2]
 CFG = yaml.safe_load(open(ROOT / "config" / "data_config.yaml"))
 
 BBOX = CFG["region"]["bbox"]
-RES = CFG["region"]["grid_resolution_deg"]
-LATS = np.arange(BBOX["lat_min"], BBOX["lat_max"] + RES, RES).round(1)
-LONS = np.arange(BBOX["lon_min"], BBOX["lon_max"] + RES, RES).round(1)
+RES  = CFG["region"]["grid_resolution_deg"]
+LATS = np.arange(BBOX["lat_min"], BBOX["lat_max"] + RES / 2, RES).round(1)
+LONS = np.arange(BBOX["lon_min"], BBOX["lon_max"] + RES / 2, RES).round(1)
 MONSOON_MONTHS = CFG["time"]["monsoon_months"]
 
 OUT = ROOT / CFG["paths"]["processed"]
 OUT.mkdir(parents=True, exist_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Process IMD Flood Event Catalog
@@ -53,10 +53,9 @@ OUT.mkdir(parents=True, exist_ok=True)
 def process_flood_events():
     """
     Parse IMD flood event catalog, filter to Uttarakhand, produce daily binary labels.
-    Flash-flood and heavy-rain events coded as flood_label=1.
 
     Source: varadtrivedi/Analysing-Flood-Risk-in-India (floods.xlsx)
-    Coverage: 1967–2023
+    Coverage: 1967-2023
     """
     src = ROOT / CFG["paths"]["raw_events"] / "floods_india.xlsx"
     if not src.exists():
@@ -66,11 +65,9 @@ def process_flood_events():
     log.info("Processing flood event catalog...")
     df = pd.read_excel(src)
 
-    # Filter to Uttarakhand events
     uk = df[df["State"].str.contains("Uttarakhand", case=False, na=False)].copy()
     log.info("  Uttarakhand events found: %d", len(uk))
 
-    # Parse dates — mixed formats in source
     def parse_date(s):
         if pd.isna(s):
             return pd.NaT
@@ -83,43 +80,46 @@ def process_flood_events():
         return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
     uk["start"] = uk["Start Date"].apply(parse_date)
-    uk["end"] = uk["End Date"].apply(parse_date)
+    uk["end"]   = uk["End Date"].apply(parse_date)
     uk = uk.dropna(subset=["start"])
 
-    # Map cause to flash-flood severity
+    FLASH_KEYWORDS = ["flash flood", "flash floods", "cloudburst", "cloud burst", "cloudbursts"]
+
     def classify_severity(cause):
         if pd.isna(cause):
             return 1
         c = str(cause).lower()
-        if any(k in c for k in ["flash flood", "cloudburst", "cloud burst", "cloudbursts", "flash floods"]):
-            return 2  # high severity
-        return 1  # standard flood/heavy rain
+        if any(k in c for k in FLASH_KEYWORDS):
+            return 2
+        return 1
 
     uk["severity"] = uk["Main Cause"].apply(classify_severity)
 
-    # Expand each event to daily rows
     records = []
     for _, row in uk.iterrows():
         start = row["start"].normalize()
-        end = row["end"] if pd.notna(row["end"]) else start + pd.Timedelta(days=1)
-        end = pd.Timestamp(end).normalize()
+        end = pd.Timestamp(row["end"]).normalize() if pd.notna(row["end"]) else start
         for day in pd.date_range(start, end, freq="D"):
-            records.append({"date": day, "severity": row["severity"], "cause": row["Main Cause"]})
+            records.append({"date": day, "severity": row["severity"]})
 
     labels_daily = pd.DataFrame(records)
     labels_daily = labels_daily.groupby("date")["severity"].max().reset_index()
-    labels_daily.columns = ["date", "flood_label"]
-    labels_daily["flood_label"] = (labels_daily["flood_label"] >= 1).astype(int)
-    labels_daily["flash_flood_label"] = (labels_daily["flood_label"] >= 2).astype(int)
 
-    log.info("  Labeled days: %d (flood=%d, flash_flood=%d)",
-             len(labels_daily),
-             labels_daily["flood_label"].sum(),
-             labels_daily["flash_flood_label"].sum())
+    # flood_label=1 for any event; flash_flood_label=1 for severity==2
+    labels_daily["flood_label"]       = 1  # all rows here are events
+    labels_daily["flash_flood_label"] = (labels_daily["severity"] >= 2).astype(int)
+    labels_daily = labels_daily.drop(columns=["severity"])
+
+    log.info(
+        "  Labeled days: %d | flood=1: %d | flash_flood=1: %d",
+        len(labels_daily),
+        labels_daily["flood_label"].sum(),
+        labels_daily["flash_flood_label"].sum(),
+    )
 
     out = OUT / "flood_labels.parquet"
     labels_daily.to_parquet(out, index=False)
-    log.info("  Saved → %s", out)
+    log.info("  Saved -> %s", out)
     return labels_daily
 
 
@@ -128,29 +128,26 @@ def process_flood_events():
 # ---------------------------------------------------------------------------
 
 def process_gpm_rainfall():
-    """Process GPM IMERG NetCDF files if present."""
     gpm_dir = ROOT / CFG["paths"]["raw_gpm"]
     nc_files = list(gpm_dir.rglob("*.nc4")) + list(gpm_dir.rglob("*.HDF5"))
     if not nc_files:
-        log.warning("GPM IMERG: No files found in %s. Using synthetic data.", gpm_dir)
+        log.warning("GPM IMERG: No files in %s. Will use synthetic data.", gpm_dir)
         return None
-
     try:
         import xarray as xr
         ds_list = []
         for f in sorted(nc_files):
             ds = xr.open_dataset(f, group="Grid")
-            # Spatial subset
             ds = ds.sel(
                 lat=slice(BBOX["lat_min"], BBOX["lat_max"]),
                 lon=slice(BBOX["lon_min"], BBOX["lon_max"]),
             )
             ds_list.append(ds["precipitationCal"])
         da = xr.concat(ds_list, dim="time")
-        df = da.to_dataframe(name="precip_mm_30min").reset_index()
-        df.to_parquet(OUT / "gpm_rainfall.parquet", index=False)
-        log.info("GPM IMERG: Processed %d files → rainfall_grid.parquet", len(nc_files))
-        return df
+        result = da.to_dataframe(name="precip_mm_30min").reset_index()
+        result.to_parquet(OUT / "gpm_rainfall.parquet", index=False)
+        log.info("GPM IMERG: Processed %d files.", len(nc_files))
+        return result
     except Exception as e:
         log.error("GPM IMERG processing error: %s", e)
         return None
@@ -161,13 +158,11 @@ def process_gpm_rainfall():
 # ---------------------------------------------------------------------------
 
 def process_era5():
-    """Process ERA5 NetCDF files if present."""
     era5_dir = ROOT / CFG["paths"]["raw_era5"]
     nc_files = list(era5_dir.rglob("*.nc"))
     if not nc_files:
-        log.warning("ERA5: No files found in %s. Using synthetic data.", era5_dir)
+        log.warning("ERA5: No files in %s. Will use synthetic data.", era5_dir)
         return None
-
     try:
         import xarray as xr
         frames = {}
@@ -179,7 +174,7 @@ def process_era5():
             )
             df = ds.to_dataframe().reset_index()
             frames[f.stem] = df
-            log.info("ERA5: Processed %s, shape=%s", f.name, df.shape)
+            log.info("ERA5: %s shape=%s", f.name, df.shape)
         return frames
     except Exception as e:
         log.error("ERA5 processing error: %s", e)
@@ -191,230 +186,191 @@ def process_era5():
 # ---------------------------------------------------------------------------
 
 def process_srtm():
-    """Process SRTM GeoTIFF to derive elevation, slope, aspect per grid cell."""
     srtm_dir = ROOT / CFG["paths"]["raw_srtm"]
     tif_files = list(srtm_dir.rglob("*.tif"))
     if not tif_files:
-        log.warning("SRTM: No GeoTIFF found in %s. Using synthetic terrain.", srtm_dir)
+        log.warning("SRTM: No GeoTIFF in %s. Will use synthetic terrain.", srtm_dir)
         return None
-
     try:
         import rasterio
-        from rasterio.merge import merge
-        from rasterio.warp import reproject, Resampling
-        import numpy as np
+        from rasterio.merge import merge as rio_merge
 
-        # Merge tiles if multiple
         datasets = [rasterio.open(f) for f in tif_files]
-        mosaic, out_transform = merge(datasets)
+        mosaic, _ = rio_merge(datasets)
         elev = mosaic[0].astype(float)
-        elev[elev < -9000] = np.nan  # nodata
+        elev[elev < -9000] = np.nan
 
-        # Derive slope and aspect using finite differences
-        dz_dy, dz_dx = np.gradient(elev, RES * 111000, RES * 111000)  # approx meters
-        slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
-        slope_deg = np.degrees(slope_rad)
+        dz_dy, dz_dx = np.gradient(elev, RES * 111000, RES * 111000)
+        slope_deg  = np.degrees(np.arctan(np.sqrt(dz_dx**2 + dz_dy**2)))
         aspect_deg = np.degrees(np.arctan2(-dz_dy, dz_dx)) % 360
 
-        # Build per-cell dataframe at target resolution
         lat_grid, lon_grid = np.meshgrid(LATS, LONS, indexing="ij")
         records = []
         for i, lat in enumerate(LATS):
             for j, lon in enumerate(LONS):
-                # Map lat/lon to pixel indices in the mosaic
-                row_frac = (lat - BBOX["lat_min"]) / (BBOX["lat_max"] - BBOX["lat_min"])
-                col_frac = (lon - BBOX["lon_min"]) / (BBOX["lon_max"] - BBOX["lon_min"])
-                ri = int(row_frac * (elev.shape[0] - 1))
-                ci = int(col_frac * (elev.shape[1] - 1))
+                ri = int((lat - BBOX["lat_min"]) / (BBOX["lat_max"] - BBOX["lat_min"]) * (elev.shape[0] - 1))
+                ci = int((lon - BBOX["lon_min"]) / (BBOX["lon_max"] - BBOX["lon_min"]) * (elev.shape[1] - 1))
+                sl = slice(max(0, ri - 2), ri + 3)
+                sc = slice(max(0, ci - 2), ci + 3)
                 records.append({
-                    "latitude": lat,
-                    "longitude": lon,
-                    "elevation_m": float(np.nanmean(elev[max(0,ri-2):ri+3, max(0,ci-2):ci+3])),
-                    "slope_deg": float(np.nanmean(slope_deg[max(0,ri-2):ri+3, max(0,ci-2):ci+3])),
-                    "aspect_deg": float(np.nanmean(aspect_deg[max(0,ri-2):ri+3, max(0,ci-2):ci+3])),
+                    "latitude": lat, "longitude": lon,
+                    "elevation_m":       float(np.nanmean(elev[sl, sc])),
+                    "slope_deg":         float(np.nanmean(slope_deg[sl, sc])),
+                    "aspect_deg":        float(np.nanmean(aspect_deg[sl, sc])),
                 })
-
         terrain_df = pd.DataFrame(records)
-        terrain_df["terrain_ruggedness"] = terrain_df["slope_deg"] / 90.0  # normalized
+        terrain_df["terrain_ruggedness"] = terrain_df["slope_deg"] / 90.0
         terrain_df.to_parquet(OUT / "terrain_grid.parquet", index=False)
-        log.info("SRTM: Terrain grid shape=%s → terrain_grid.parquet", terrain_df.shape)
+        log.info("SRTM: terrain grid %s", terrain_df.shape)
         return terrain_df
-
     except Exception as e:
         log.error("SRTM processing error: %s", e)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Generate Synthetic Environmental Data (when real data unavailable)
+# Step 5: Vectorized Synthetic Environmental Data Generator
 # ---------------------------------------------------------------------------
-# Physics-based synthetic data for Uttarakhand using published statistics:
-#
-# Rainfall climatology:
-#   Bhatt & Nakamura (2005): Uttarakhand monsoon (JJAS) mean ~1500–2000 mm/season
-#   IMD gridded 0.25° data statistics from Pai et al. (2014)
-#   Mean daily monsoon rainfall ~10–20 mm/day; extreme events 100–300 mm/day
-#
-# Temperature:
-#   Valley stations (Dehradun ~700m): 25–35°C summer, 5–15°C winter
-#   High altitude (>2000m): subtract ~6.5°C per 1000m lapse rate
-#
-# Terrain:
-#   Uttarakhand elevation: Gangetic plain ~200m → High Himalaya ~7000m
-#   SRTM statistics from Dimri et al. (2017): median slope ~28°, aspect mostly S/SW
+# Physics-based synthetic data using published statistics:
+#   Bhatt & Nakamura (2005): Uttarakhand JJAS mean ~1500-2000 mm/season
+#   Pai et al. (2014): IMD 0.25deg gridded rainfall statistics
+#   Dimri et al. (2017): SRTM terrain stats, median slope ~28 deg
 
 def generate_synthetic_environmental_data(labels_df=None):
     """
-    Generate physics-based synthetic environmental data for Uttarakhand.
+    Fully vectorized generation of synthetic environmental data.
 
-    DATA IS SYNTHETIC — clearly labeled in output.
-    Use this ONLY for pipeline testing until real GPM/ERA5/SRTM data is downloaded.
-
-    Based on:
-      - IMD observed statistics for Uttarakhand monsoon
-      - Published ERA5 climatology for 28-32°N, 77-81°E
-      - SRTM terrain statistics for Himalayan region
+    DATA IS SYNTHETIC - labeled as data_source=SYNTHETIC.
+    For pipeline testing only. Replace with real GPM/ERA5 when credentials available.
     """
-    log.info("Generating synthetic environmental data (pipeline testing mode)...")
-    log.warning("SYNTHETIC DATA — not for final model. Download real data using download_data.py")
+    log.info("Generating synthetic environmental data (vectorized)...")
+    log.warning("SYNTHETIC DATA - not for final model. See download_data.py for real data.")
 
     rng = np.random.default_rng(42)
 
-    # 3-hourly time index, monsoon months 2001-2023
-    date_range = pd.date_range(
-        # For synthetic testing, use last 5 years to keep dataset manageable
-        start="2019-01-01",
-        end="2023-12-31",
-        freq="3h",
-    )
+    # --- Time index: monsoon months, 2019-2023, 3-hourly ---
+    date_range   = pd.date_range(start="2019-01-01", end="2023-12-31", freq="3h")
     monsoon_mask = date_range.month.isin(MONSOON_MONTHS)
-    timestamps = date_range[monsoon_mask]
-    n_times = len(timestamps)
-    log.info("  Time steps (monsoon 3H, 2001-2023): %d", n_times)
+    timestamps   = date_range[monsoon_mask]
+    n_times      = len(timestamps)
+    log.info("  Monsoon 3h timesteps (2019-2023): %d", n_times)
 
-    # --- Terrain grid (static) ---
+    # --- Static terrain grid ---
     lat_grid, lon_grid = np.meshgrid(LATS, LONS, indexing="ij")
-    n_lat, n_lon = lat_grid.shape
-    n_cells = n_lat * n_lon
+    n_cells = lat_grid.size
 
-    # Elevation: increases from SW (plain) to NE (Himalaya)
-    # Gangetic plain in south ~200-400m, high peaks in north ~5000-7000m
-    elev_base = 200 + (lat_grid - BBOX["lat_min"]) / (BBOX["lat_max"] - BBOX["lat_min"]) * 4000
-    elev_base += (lon_grid - 79.0) * 200  # some east-west variation
-    elev_noise = rng.normal(0, 300, lat_grid.shape)
-    elevation = np.clip(elev_base + elev_noise, 200, 7000).flatten()
-
-    # Slope: higher at mid-altitudes (mountain flanks), lower on plains and peaks
-    elev_flat = elevation
-    slope = 5 + (np.clip(elev_flat, 500, 4000) - 500) / 3500 * 35
-    slope += rng.normal(0, 5, n_cells)
-    slope = np.clip(slope, 0, 60)
-
-    # Aspect: roughly south-facing (180°) with noise
-    aspect = rng.uniform(90, 270, n_cells)
+    elev_base  = 200 + (lat_grid - BBOX["lat_min"]) / (BBOX["lat_max"] - BBOX["lat_min"]) * 4000
+    elev_base += (lon_grid - 79.0) * 200
+    elevation  = np.clip(elev_base + rng.normal(0, 300, lat_grid.shape), 200, 7000)
+    slope      = np.clip(
+        5 + (np.clip(elevation, 500, 4000) - 500) / 3500 * 35 + rng.normal(0, 5, elevation.shape),
+        0, 60,
+    )
+    aspect     = rng.uniform(90, 270, elevation.shape)
 
     terrain_df = pd.DataFrame({
-        "latitude": lat_grid.flatten(),
-        "longitude": lon_grid.flatten(),
-        "elevation_m": elevation,
-        "slope_deg": slope,
-        "aspect_deg": aspect,
-        "terrain_ruggedness": slope / 90.0,
-        "data_source": "SYNTHETIC",
+        "latitude":           lat_grid.flatten(),
+        "longitude":          lon_grid.flatten(),
+        "elevation_m":        elevation.flatten(),
+        "slope_deg":          slope.flatten(),
+        "aspect_deg":         aspect.flatten(),
+        "terrain_ruggedness": slope.flatten() / 90.0,
+        "data_source":        "SYNTHETIC",
     })
     terrain_df.to_parquet(OUT / "terrain_grid.parquet", index=False)
-    log.info("  Terrain: %d grid cells saved", n_cells)
+    log.info("  Terrain: %d cells saved", n_cells)
 
-    # --- Rainfall + weather grid (time-varying) ---
-    # For efficiency: generate for all grid cells × all time steps in chunks
-    # Relationship with flood events:
-    #   On flood event days: rainfall boosted (physically realistic)
-    #   On non-event days: background monsoon climatology
-
-    # Create set of flood days for label linkage
+    # --- Flood day lookup set ---
     flood_days = set()
     if labels_df is not None:
-        flood_rows = labels_df[labels_df["flood_label"] == 1]
-        flood_days = set(flood_rows["date"].dt.normalize())
+        flood_days = set(pd.to_datetime(labels_df["date"]).dt.normalize())
 
-    records = []
-    lat_arr = lat_grid.flatten()
-    lon_arr = lon_grid.flatten()
+    # --- Vectorized environmental generation ---
+    # Shape strategy:
+    #   time-varying scalars: (n_times,) arrays
+    #   cell-varying scalars: (n_cells,) arrays
+    #   broadcast together to (n_times, n_cells), then flatten
 
-    for i_t, ts in enumerate(timestamps):
-        if i_t % 2000 == 0:
-            log.info("  Generating timestep %d/%d (%s)", i_t, n_times, ts.date())
+    doy        = timestamps.day_of_year.values.astype(float)        # (T,)
+    hour       = timestamps.hour.values.astype(float)                # (T,)
+    is_flood   = np.array([
+        pd.Timestamp(ts.date()) in flood_days for ts in timestamps
+    ], dtype=bool)                                                    # (T,)
 
-        is_flood_day = pd.Timestamp(ts.date()) in flood_days
-        hour_of_day = ts.hour
-        day_of_year = ts.day_of_year
+    seasonal_factor = 1.0 + 0.5 * np.sin((doy - 150) / 365 * 2 * np.pi)  # (T,)
+    diurnal_factor  = 1.0 + 0.4 * np.sin((hour - 6)  / 24  * 2 * np.pi)  # (T,)
+    time_factor     = seasonal_factor * diurnal_factor                      # (T,)
 
-        # Seasonal monsoon strength: peaks in July-August
-        seasonal_factor = 1.0 + 0.5 * np.sin((day_of_year - 150) / 365 * 2 * np.pi)
-        # Diurnal: afternoon maximum (local convective peak)
-        diurnal_factor = 1.0 + 0.4 * np.sin((hour_of_day - 6) / 24 * 2 * np.pi)
+    elev_flat = elevation.flatten()                                          # (C,)
+    orographic = 1.0 + 0.8 * np.exp(-((elev_flat - 1500) ** 2) / (1000 ** 2))  # (C,)
+    base_rate  = 2.0 * orographic                                            # (C,)
 
-        for i_c in range(n_cells):
-            lat = lat_arr[i_c]
-            lon = lon_arr[i_c]
-            elev = elevation[i_c]
-            slp = slope[i_c]
+    # Broadcast: (T,1) * (1,C) -> (T,C)
+    tf  = time_factor[:, np.newaxis]     # (T,1)
+    br  = base_rate[np.newaxis, :]       # (1,C)
+    eff = tf * br                        # (T,C)
 
-            # Rainfall (mm/3h)
-            # Orographic enhancement at elevation 500-2500m
-            orographic_factor = 1.0 + 0.8 * np.exp(-((elev - 1500) ** 2) / (1000 ** 2))
-            base_precip_rate = 2.0 * seasonal_factor * diurnal_factor * orographic_factor
+    log.info("  Generating precipitation array (%d x %d)...", n_times, n_cells)
 
-            if is_flood_day:
-                # Flood day: heavy rainfall event (cloudburst/extreme)
-                precip_3h = rng.gamma(shape=3.0, scale=base_precip_rate * 5)
-            else:
-                # Normal monsoon day: intermittent rainfall
-                if rng.random() < 0.35:  # ~35% of 3h slots have rain during monsoon
-                    precip_3h = rng.gamma(shape=1.2, scale=base_precip_rate)
-                else:
-                    precip_3h = 0.0
-            precip_3h = float(np.clip(precip_3h, 0, 200))
+    # Rain mask: ~35% wet periods on non-flood days
+    rain_mask = rng.random((n_times, n_cells)) < 0.35
 
-            # Temperature (°C): decreases with elevation (6.5°C/1000m lapse)
-            t_sea_level = 30 - 10 * (day_of_year - 90) / 365  # seasonal cycle
-            t_sea_level += 5 * np.sin((hour_of_day - 14) / 24 * 2 * np.pi)  # diurnal
-            temp_2m = t_sea_level - 6.5 * elev / 1000 + rng.normal(0, 1.5)
-            temp_2m = float(np.clip(temp_2m, -20, 40))
+    # Non-flood rainfall: gamma with shape=1.2, scale=eff
+    precip = np.where(rain_mask, rng.gamma(1.2, eff), 0.0)
 
-            # Humidity (%): higher during monsoon, lower at altitude
-            humidity_base = 80 if month_in_monsoon(ts.month) else 50
-            humidity = humidity_base - 0.003 * elev + rng.normal(0, 8)
-            humidity = float(np.clip(humidity, 10, 100))
+    # Flood day rows: override with heavy gamma (shape=3, scale=5*eff)
+    flood_idx = np.where(is_flood)[0]
+    if flood_idx.size > 0:
+        heavy = rng.gamma(3.0, 5.0 * eff[flood_idx, :])
+        precip[flood_idx, :] = heavy
 
-            # Pressure (hPa): decreases with altitude
-            pressure = 1013.25 * (1 - 0.0000226 * elev) ** 5.256 + rng.normal(0, 1)
-            pressure = float(np.clip(pressure, 400, 1020))
+    precip = np.clip(precip, 0, 200).astype(np.float32)
 
-            # Soil moisture (m³/m³): 0.1–0.5, higher after heavy rain
-            soil_moisture = 0.2 + 0.15 * (precip_3h / 50) + rng.normal(0, 0.03)
-            soil_moisture = float(np.clip(soil_moisture, 0.05, 0.5))
+    # Temperature: (T,1) broadcast with (1,C)
+    t_base = 30 - 10 * (doy[:, np.newaxis] - 90) / 365  # seasonal
+    t_base += 5 * np.sin((hour[:, np.newaxis] - 14) / 24 * 2 * np.pi)  # diurnal
+    temp   = t_base - 6.5 * elev_flat[np.newaxis, :] / 1000
+    temp  += rng.normal(0, 1.5, (n_times, n_cells)).astype(np.float32)
+    temp   = np.clip(temp, -20, 40).astype(np.float32)
 
-            records.append({
-                "timestamp": ts,
-                "latitude": round(lat, 1),
-                "longitude": round(lon, 1),
-                "precip_3h_mm": round(precip_3h, 3),
-                "temperature_2m_c": round(temp_2m, 2),
-                "humidity_pct": round(humidity, 1),
-                "pressure_hpa": round(pressure, 1),
-                "soil_moisture_m3m3": round(soil_moisture, 4),
-                "data_source": "SYNTHETIC",
-            })
+    # Humidity: (T,C)
+    hum_base = 80.0  # monsoon months only
+    hum      = (hum_base - 0.003 * elev_flat[np.newaxis, :]) * np.ones((n_times, 1), dtype=np.float32)
+    hum     += rng.normal(0, 8, (n_times, n_cells)).astype(np.float32)
+    hum      = np.clip(hum, 10, 100).astype(np.float32)
 
-    env_df = pd.DataFrame(records)
-    env_df.to_parquet(OUT / "environmental_grid.parquet", index=False)
-    log.info("  Environmental grid: %d rows saved", len(env_df))
+    # Pressure
+    pres = (1013.25 * (1 - 2.26e-5 * elev_flat[np.newaxis, :]) ** 5.256
+            + rng.normal(0, 1, (n_times, n_cells)).astype(np.float32))
+    pres = np.clip(pres, 400, 1020).astype(np.float32)
+
+    # Soil moisture
+    sm = 0.2 + 0.15 * (precip / 50) + rng.normal(0, 0.03, (n_times, n_cells)).astype(np.float32)
+    sm = np.clip(sm, 0.05, 0.5).astype(np.float32)
+
+    log.info("  Building DataFrame (%d rows)...", n_times * n_cells)
+
+    # Repeat timestamps for each cell; tile cell coords for each time
+    ts_repeated  = np.repeat(timestamps, n_cells)
+    lat_tiled    = np.tile(lat_grid.flatten(), n_times)
+    lon_tiled    = np.tile(lon_grid.flatten(), n_times)
+
+    env_df = pd.DataFrame({
+        "timestamp":           ts_repeated,
+        "latitude":            lat_tiled.astype(np.float32),
+        "longitude":           lon_tiled.astype(np.float32),
+        "precip_3h_mm":        precip.flatten(),
+        "temperature_2m_c":    temp.flatten(),
+        "humidity_pct":        hum.flatten(),
+        "pressure_hpa":        pres.flatten(),
+        "soil_moisture_m3m3":  sm.flatten(),
+        "data_source":         "SYNTHETIC",
+    })
+
+    out = OUT / "environmental_grid.parquet"
+    env_df.to_parquet(out, index=False)
+    log.info("  Environmental grid: %d rows saved -> %s", len(env_df), out)
     return env_df, terrain_df
-
-
-def month_in_monsoon(m):
-    return m in MONSOON_MONTHS
 
 
 # ---------------------------------------------------------------------------
@@ -424,30 +380,27 @@ def month_in_monsoon(m):
 def main():
     log.info("=== process_data.py ===")
 
-    # Step 1: Flood event labels (real IMD data)
     labels_df = process_flood_events()
 
-    # Step 2–4: Try real data, fall back to synthetic
     rainfall_ok = process_gpm_rainfall()
-    era5_ok = process_era5()
-    terrain_ok = process_srtm()
+    era5_ok     = process_era5()
+    terrain_ok  = process_srtm()
 
-    real_env = all([rainfall_ok is not None, era5_ok is not None])
+    real_env = (rainfall_ok is not None) and (era5_ok is not None)
 
     if not real_env:
-        log.info("Real environmental data not available. Generating synthetic data for pipeline testing.")
+        log.info("Real environmental data unavailable. Generating synthetic data.")
         generate_synthetic_environmental_data(labels_df=labels_df)
         log.info(
             "\n*** SYNTHETIC DATA NOTICE ***\n"
-            "Environmental data (rainfall/weather) is SYNTHETIC.\n"
-            "To use real data:\n"
-            "  1. Set EARTHDATA_USERNAME/EARTHDATA_PASSWORD and run: python src/data/download_data.py --source gpm\n"
-            "  2. Create ~/.cdsapirc and run: python src/data/download_data.py --source era5\n"
-            "  3. Re-run: python src/data/process_data.py\n"
-            "Flood event labels are REAL (IMD catalog)."
+            "Environmental data is SYNTHETIC (pipeline testing only).\n"
+            "Set EARTHDATA_USERNAME/EARTHDATA_PASSWORD and run:\n"
+            "  python src/data/download_data.py --source gpm\n"
+            "  python src/data/download_data.py --source era5\n"
+            "Then re-run this script. Flood labels are REAL (IMD catalog)."
         )
     else:
-        log.info("Real environmental data processed successfully.")
+        log.info("Real environmental data processed.")
 
     log.info("Processing complete. Output: %s", OUT)
 
