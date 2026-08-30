@@ -126,9 +126,10 @@ def _list_day_files(session: requests.Session, date: datetime.date) -> list:
 
 
 def _download_one_file(session: requests.Session, date: datetime.date,
-                       fname: str, outdir: Path) -> Path:
+                       fname: str, outdir: Path,
+                       max_retries: int = 3) -> Path:
     """
-    Download one HDF5 file from GES DISC.
+    Download one HDF5 file from GES DISC with retry on connection errors.
     Bearer token in session headers handles auth without redirect issues.
     Verifies minimum file size and HDF5 magic bytes.
     """
@@ -139,60 +140,87 @@ def _download_one_file(session: requests.Session, date: datetime.date,
 
     doy = date.strftime("%j")
     url = f"{GESDISC_BASE}/{date.year}/{doy}/{fname}"
-    log.info("  Downloading: %s", fname)
 
-    r = session.get(url, stream=True, timeout=180, allow_redirects=True)
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            wait = 5 * attempt
+            log.info("  Retry %d/%d for %s (waiting %ds)...", attempt, max_retries, fname, wait)
+            time.sleep(wait)
 
-    if r.status_code == 401:
-        raise RuntimeError(
-            f"HTTP 401 downloading {fname}. "
-            "Approve GES DISC app: "
-            "https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
-        )
-    if r.status_code != 200:
-        body_preview = r.content[:500].decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"HTTP {r.status_code} downloading {fname}.\n"
-            f"Response preview: {body_preview}"
-        )
+        # Remove partial file from previous attempt
+        if fpath.exists():
+            fpath.unlink()
 
-    # Check Content-Type — error pages return text/html
-    ctype = r.headers.get("Content-Type", "")
-    if "html" in ctype.lower():
-        body = r.content[:1000].decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"GES DISC returned HTML instead of HDF5 (Content-Type: {ctype}).\n"
-            f"This usually means the GES DISC app is not approved.\n"
-            f"Approve at: https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg\n"
-            f"Response preview:\n{body[:500]}"
-        )
+        log.info("  Downloading: %s (attempt %d)", fname, attempt)
+        try:
+            r = session.get(url, stream=True, timeout=180, allow_redirects=True)
 
-    with open(fpath, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            f.write(chunk)
+            if r.status_code == 401:
+                raise RuntimeError(
+                    f"HTTP 401 downloading {fname}. "
+                    "Approve GES DISC app: "
+                    "https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg"
+                )
+            if r.status_code != 200:
+                body_preview = r.content[:500].decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"HTTP {r.status_code} downloading {fname}.\n"
+                    f"Response preview: {body_preview}"
+                )
 
-    size_mb = fpath.stat().st_size / 1e6
-    log.info("  Written: %.2f MB", size_mb)
+            ctype = r.headers.get("Content-Type", "")
+            if "html" in ctype.lower():
+                body = r.content[:1000].decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"GES DISC returned HTML (Content-Type: {ctype}). "
+                    f"Approve app at: https://urs.earthdata.nasa.gov/approve_app?client_id=ijpRZvb9qeKCK5ctsn75Tg\n"
+                    f"Preview: {body[:300]}"
+                )
 
-    if size_mb < 0.5:
-        content = fpath.read_bytes()
-        fpath.unlink()
-        raise RuntimeError(
-            f"File too small ({size_mb:.3f} MB). "
-            f"First 200 bytes: {content[:200]}"
-        )
+            with open(fpath, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    fh.write(chunk)
 
-    # Verify HDF5 magic bytes: first 8 bytes must be \x89HDF\r\n\x1a\n
-    magic = fpath.read_bytes()[:8]
-    if magic != b"\x89HDF\r\n\x1a\n":
-        fpath.unlink()
-        raise RuntimeError(
-            f"Not a valid HDF5 file (bad magic bytes: {magic!r}). "
-            "Response was probably an HTML error page saved to disk."
-        )
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            log.warning("  Connection error on attempt %d: %s", attempt, e)
+            if attempt == max_retries:
+                if fpath.exists():
+                    fpath.unlink()
+                raise RuntimeError(
+                    f"Failed to download {fname} after {max_retries} attempts: {e}"
+                )
+            continue  # retry
 
-    log.info("  HDF5 magic verified ✓  (%s, %.2f MB)", fname, size_mb)
-    return fpath
+        # Validate downloaded file
+        size_mb = fpath.stat().st_size / 1e6
+        log.info("  Written: %.2f MB", size_mb)
+
+        if size_mb < 0.5:
+            content = fpath.read_bytes()
+            fpath.unlink()
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"File too small ({size_mb:.3f} MB) after {max_retries} attempts. "
+                    f"First 200 bytes: {content[:200]}"
+                )
+            log.warning("  File too small (%.3f MB), retrying...", size_mb)
+            continue  # retry
+
+        magic = fpath.read_bytes()[:8]
+        if magic != b"\x89HDF\r\n\x1a\n":
+            fpath.unlink()
+            raise RuntimeError(
+                f"Not a valid HDF5 file (bad magic: {magic!r}). "
+                "Likely an HTML error page."
+            )
+
+        log.info("  HDF5 magic verified ✓  (%s, %.2f MB)", fname, size_mb)
+        return fpath  # success
+
+    # Should not reach here
+    raise RuntimeError(f"Download failed for {fname} after {max_retries} attempts")
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +367,8 @@ def _verify_hdf5_content(fpath: Path):
             return
 
     import datetime as dt_mod
-    ts    = dt_mod.datetime.fromtimestamp(t_sec, tz=dt_mod.timezone.utc)
+    GPS_EPOCH = dt_mod.datetime(1980, 1, 6, 0, 0, 0)
+    ts = GPS_EPOCH + dt_mod.timedelta(seconds=t_sec)
     valid = precip[precip > -9000]
     log.info("  HDF5 content verification:")
     log.info("    Timestamp   : %s UTC", ts)

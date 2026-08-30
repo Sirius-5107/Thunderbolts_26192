@@ -21,7 +21,7 @@ Run after download_data.py --source gpm
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -96,9 +96,12 @@ def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):
                             lat_idx[0]:lat_idx[-1] + 1]  # (n_lon, n_lat)
             axis_order = "time,lon,lat"
 
-        # Timestamp: seconds since 1970-01-01 UTC
+        # Timestamp: GPM IMERG stores seconds since GPS epoch 1980-01-06 00:00:00 UTC
+        # (NOT Unix epoch 1970-01-01)
+        # GPM IMERG time = seconds since GPS epoch 1980-01-06 00:00:00 UTC
+        GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
         t_sec = int(grp["time"][0])
-        ts = datetime.fromtimestamp(t_sec, tz=timezone.utc).replace(tzinfo=None)
+        ts = GPS_EPOCH + timedelta(seconds=t_sec)
 
         sub_lats = lats[lat_idx]
         sub_lons = lons[lon_idx]
