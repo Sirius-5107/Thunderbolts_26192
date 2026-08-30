@@ -137,17 +137,28 @@ def process_gpm_rainfall():
     gpm_dir     = ROOT / CFG["paths"]["raw_gpm"]
     hdf5_files  = list(gpm_dir.rglob("*.HDF5"))
 
-    # Case 1: processed parquet already exists
-    if gpm_parquet.exists():
-        log.info("GPM IMERG: Loading existing gpm_rainfall.parquet")
-        df = pd.read_parquet(gpm_parquet)
-        log.info("GPM IMERG: %d rows, %s to %s",
-                 len(df), df["timestamp"].min(), df["timestamp"].max())
-        return df
-
-    # Case 2: raw HDF5 present — run processor
+    # Case 1: raw HDF5 files present — check if parquet is up-to-date
     if hdf5_files:
-        log.info("GPM IMERG: %d HDF5 files found. Running process_gpm.py...", len(hdf5_files))
+        n_hdf5 = len(hdf5_files)
+        # Invalidate parquet cache if:
+        #   a) parquet doesn't exist, OR
+        #   b) parquet is older than the newest HDF5 file
+        parquet_stale = True
+        if gpm_parquet.exists():
+            parquet_mtime = gpm_parquet.stat().st_mtime
+            newest_hdf5   = max(f.stat().st_mtime for f in hdf5_files)
+            parquet_stale = newest_hdf5 > parquet_mtime
+            if not parquet_stale:
+                log.info("GPM IMERG: parquet up-to-date, loading cached file")
+                df = pd.read_parquet(gpm_parquet)
+                log.info("GPM IMERG: %d rows, %s to %s",
+                         len(df), df["timestamp"].min(), df["timestamp"].max())
+                return df
+            else:
+                log.info("GPM IMERG: %d new/updated HDF5 files detected — reprocessing", n_hdf5)
+        else:
+            log.info("GPM IMERG: %d HDF5 files found. Running process_gpm.py...", n_hdf5)
+
         import subprocess, sys
         result = subprocess.run(
             [sys.executable, str(ROOT / "src" / "data" / "process_gpm.py")],
