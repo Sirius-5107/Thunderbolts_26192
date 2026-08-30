@@ -134,7 +134,7 @@ def _download_one_file(session: requests.Session, date: datetime.date,
     Verifies minimum file size and HDF5 magic bytes.
     """
     fpath = outdir / fname
-    if fpath.exists() and fpath.stat().st_size > 500_000:
+    if fpath.exists() and fpath.stat().st_size > 5_000_000:  # valid GPM files are ~8MB
         log.info("  Already exists: %s (%.1f MB)", fname, fpath.stat().st_size / 1e6)
         return fpath
 

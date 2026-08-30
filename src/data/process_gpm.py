@@ -195,6 +195,10 @@ def main():
                 frames.append(df)
         except Exception as e:
             log.error("  Failed to parse %s: %s", fpath.name, e)
+            # Delete truncated/corrupt files so the downloader re-fetches them
+            if fpath.exists():
+                fpath.unlink()
+                log.warning("  Deleted corrupt file: %s (will be re-downloaded)", fpath.name)
             continue
 
     if not frames:
