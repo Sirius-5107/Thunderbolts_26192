@@ -46,31 +46,39 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 def parse_imerg_nc4(fpath: Path):
     """
-    Parse an OPeNDAP-subset NetCDF4 file (.HDF5.nc4).
+    Parse an OPeNDAP-subset file (.HDF5.nc4) from GES DISC.
 
-    These are small bbox-only files downloaded via GES DISC OPeNDAP subsetting.
-    Variables: precipitation (mm/hr), lat, lon, time (GPS seconds since 1980-01-06)
-    Array order: precipitation[time=1, lon=N, lat=M]
+    Despite the .nc4 extension, GES DISC OPeNDAP returns HDF5 format.
+    The file contains only the requested bbox subset (~20-50 KB).
+    We detect the actual format from magic bytes and parse accordingly.
+
+    Tries h5py first (HDF5), falls back to netCDF4 library if needed.
     """
-    import netCDF4 as nc
-    with nc.Dataset(str(fpath), "r") as ds:
-        lats   = np.array(ds.variables["lat"][:])
-        lons   = np.array(ds.variables["lon"][:])
-        t_sec  = int(ds.variables["time"][0])
-        precip = np.array(ds.variables["precipitation"][0, :, :], dtype=np.float32)
-
-    GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
-    ts = GPS_EPOCH + timedelta(seconds=t_sec)
-
-    precip[precip < -9000] = np.nan
-    lon_grid, lat_grid = np.meshgrid(lons, lats, indexing="ij")
-
-    return pd.DataFrame({
-        "timestamp":    ts,
-        "latitude":     lat_grid.flatten().astype(np.float32),
-        "longitude":    lon_grid.flatten().astype(np.float32),
-        "precip_mm_hr": precip.flatten(),
-    })
+    magic = fpath.read_bytes()[:4]
+    if magic == b"\x89HDF":
+        # GES DISC OPeNDAP returned HDF5 — parse same as full file
+        # but the subset only contains bbox lat/lon range
+        return parse_imerg_hdf5(fpath,
+                                 BBOX["lat_min"], BBOX["lat_max"],
+                                 BBOX["lon_min"], BBOX["lon_max"])
+    else:
+        # Try netCDF4 (classic CDF format)
+        import netCDF4 as nc
+        with nc.Dataset(str(fpath), "r") as ds:
+            lats   = np.array(ds.variables["lat"][:])
+            lons   = np.array(ds.variables["lon"][:])
+            t_sec  = int(ds.variables["time"][0])
+            precip = np.array(ds.variables["precipitation"][0, :, :], dtype=np.float32)
+        GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
+        ts = GPS_EPOCH + timedelta(seconds=t_sec)
+        precip[precip < -9000] = np.nan
+        lon_grid, lat_grid = np.meshgrid(lons, lats, indexing="ij")
+        return pd.DataFrame({
+            "timestamp":    ts,
+            "latitude":     lat_grid.flatten().astype(np.float32),
+            "longitude":    lon_grid.flatten().astype(np.float32),
+            "precip_mm_hr": precip.flatten(),
+        })
 
 
 def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):

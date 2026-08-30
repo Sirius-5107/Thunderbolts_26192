@@ -238,7 +238,9 @@ def _download_one_file(session: requests.Session, date: datetime.date,
         size_mb = fpath.stat().st_size / 1e6
         log.info("  Written: %.2f MB", size_mb)
 
-        if size_mb < 0.5:
+        # OPeNDAP bbox subsets are legitimately small (~20-50 KB)
+        size_threshold_mb = 0.005 if use_opendap else 0.5
+        if size_mb < size_threshold_mb:
             content = fpath.read_bytes()
             fpath.unlink()
             if attempt == max_retries:
