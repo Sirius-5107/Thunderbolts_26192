@@ -60,7 +60,8 @@ def load_config():
 
 URS_TOKEN_URL = "https://urs.earthdata.nasa.gov/api/users/find_or_create_token"
 URS_LOGIN     = "https://urs.earthdata.nasa.gov"
-GESDISC_BASE  = "https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHH.07"
+GESDISC_BASE    = "https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHH.07"
+GESDISC_OPENDAP = "https://gpm1.gesdisc.eosdis.nasa.gov/opendap/GPM_L3/GPM_3IMERGHH.07"
 
 
 def _get_bearer_token(user: str, pwd: str) -> str:
@@ -125,21 +126,61 @@ def _list_day_files(session: requests.Session, date: datetime.date) -> list:
     return sorted(set(files))
 
 
+def _opendap_subset_url(date: datetime.date, fname: str,
+                         lat_min: float, lat_max: float,
+                         lon_min: float, lon_max: float) -> str:
+    """
+    Build an OPeNDAP URL that downloads ONLY the Uttarakhand bbox subset.
+
+    GPM IMERG V07B global grid: lat 1800 pts (-89.95 to 89.95, S->N, 0.1 deg)
+                                 lon 3600 pts (-179.95 to 179.95, W->E, 0.1 deg)
+    Array axis order: [time, lon, lat]  (V07B)
+
+    OPeNDAP slice notation: variable[time_start:time_end][lon_start:lon_end][lat_start:lat_end]
+    Returns a .nc4 NetCDF4 file with only the requested subset (~50-200 KB vs 8.5 MB full file).
+    """
+    doy = date.strftime("%j")
+    # Convert geographic coords to array indices
+    lat_i0 = round((lat_min + 90.0) / 0.1)
+    lat_i1 = round((lat_max + 90.0) / 0.1)
+    lon_i0 = round((lon_min + 180.0) / 0.1)
+    lon_i1 = round((lon_max + 180.0) / 0.1)
+    base = f"{GESDISC_OPENDAP}/{date.year}/{doy}/{fname}.nc4"
+    query = (
+        f"?precipitation[0:0][{lon_i0}:{lon_i1}][{lat_i0}:{lat_i1}]"
+        f",time[0:0],lon[{lon_i0}:{lon_i1}],lat[{lat_i0}:{lat_i1}]"
+    )
+    return base + query
+
+
 def _download_one_file(session: requests.Session, date: datetime.date,
                        fname: str, outdir: Path,
+                       bbox: dict = None,
                        max_retries: int = 3) -> Path:
     """
-    Download one HDF5 file from GES DISC with retry on connection errors.
-    Bearer token in session headers handles auth without redirect issues.
-    Verifies minimum file size and HDF5 magic bytes.
+    Download one GPM IMERG file via OPeNDAP spatial subset (bbox only).
+
+    OPeNDAP returns a NetCDF4 (.nc4) file containing only the requested
+    lat/lon bbox — ~50-200 KB instead of the 8.5 MB global HDF5 file.
+    Saved with .nc4 extension; process_gpm.py handles both HDF5 and NC4.
+
+    Falls back to full HDF5 download if bbox is None.
     """
-    fpath = outdir / fname
-    if fpath.exists() and fpath.stat().st_size > 5_000_000:  # valid GPM files are ~8MB
-        log.info("  Already exists: %s (%.1f MB)", fname, fpath.stat().st_size / 1e6)
+    # Use .nc4 extension for OPeNDAP subset files
+    use_opendap = bbox is not None
+    out_name = fname + ".nc4" if use_opendap else fname
+    fpath = outdir / out_name
+    min_size = 10_000 if use_opendap else 5_000_000  # subsets are small
+    if fpath.exists() and fpath.stat().st_size > min_size:
         return fpath
 
     doy = date.strftime("%j")
-    url = f"{GESDISC_BASE}/{date.year}/{doy}/{fname}"
+    if use_opendap:
+        url = _opendap_subset_url(date, fname,
+                                   bbox["lat_min"], bbox["lat_max"],
+                                   bbox["lon_min"], bbox["lon_max"])
+    else:
+        url = f"{GESDISC_BASE}/{date.year}/{doy}/{fname}"
 
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
@@ -208,15 +249,21 @@ def _download_one_file(session: requests.Session, date: datetime.date,
             log.warning("  File too small (%.3f MB), retrying...", size_mb)
             continue  # retry
 
-        magic = fpath.read_bytes()[:8]
-        if magic != b"\x89HDF\r\n\x1a\n":
+        # Verify file type
+        header = fpath.read_bytes()[:8]
+        if use_opendap:
+            # NetCDF4 magic: starts with \x89HDF (same as HDF5) or CDF\x01/CDF\x02
+            valid = header[:4] in (b"\x89HDF", b"CDF\x01", b"CDF\x02")
+        else:
+            valid = header == b"\x89HDF\r\n\x1a\n"
+        if not valid:
             fpath.unlink()
             raise RuntimeError(
-                f"Not a valid HDF5 file (bad magic: {magic!r}). "
+                f"Invalid file (bad header: {header!r}). "
                 "Likely an HTML error page."
             )
 
-        log.info("  HDF5 magic verified ✓  (%s, %.2f MB)", fname, size_mb)
+        log.info("  ✓ %s (%.1f KB)", out_name, fpath.stat().st_size / 1e3)
         return fpath  # success
 
     # Should not reach here
@@ -230,13 +277,16 @@ def _download_one_file(session: requests.Session, date: datetime.date,
 def download_gpm(cfg, start_override=None, end_override=None,
                  test_one=False) -> bool:
     """
-    Download GPM IMERG Final Run V07 HDF5 files.
+    Download GPM IMERG Final Run V07 half-hourly data via OPeNDAP spatial subset.
 
-    Authentication: NASA Earthdata Bearer token (correct method for GES DISC).
-    Files saved to: data/raw/gpm/YYYY/DOY/
+    Uses OPeNDAP to download ONLY the Uttarakhand bbox (~50-200 KB per file)
+    instead of full global HDF5 files (~8.5 MB each). This reduces storage
+    from ~600 GB (5 years full) to ~3-5 GB (3 monsoon seasons subsetted).
 
-    Args:
-        test_one: If True, download only the first file of start_date and stop.
+    Default scope: 3 monsoon seasons (2021-2023, Jun-Sep) — sufficient for ML.
+    Override with --start / --end for custom ranges.
+
+    Files saved as: data/raw/gpm/YYYY/DOY/<filename>.HDF5.nc4
     """
     user = os.environ.get("EARTHDATA_USERNAME", "").strip()
     pwd  = os.environ.get("EARTHDATA_PASSWORD", "").strip()
@@ -247,10 +297,26 @@ def download_gpm(cfg, start_override=None, end_override=None,
         )
         return False
 
-    start_str = start_override or "2023-08-01"
-    end_str   = end_override   or "2023-08-31"
-    start_dt  = datetime.date.fromisoformat(start_str)
-    end_dt    = datetime.date.fromisoformat(end_str)
+    bbox = cfg["region"]["bbox"]
+
+    # Default: 3 monsoon seasons 2021-2023 (Jun-Sep only)
+    if start_override:
+        start_dt = datetime.date.fromisoformat(start_override)
+        end_dt   = datetime.date.fromisoformat(end_override or start_override)
+        date_ranges = [(start_dt, end_dt)]
+    else:
+        monsoon_months = set(cfg["time"]["monsoon_months"])
+        date_ranges = []
+        for year in [2021, 2022, 2023]:
+            for month in sorted(monsoon_months):
+                import calendar
+                last_day = calendar.monthrange(year, month)[1]
+                date_ranges.append((
+                    datetime.date(year, month, 1),
+                    datetime.date(year, month, last_day),
+                ))
+        log.info("GPM: Default scope = 3 monsoon seasons (2021-2023, Jun-Sep)")
+        log.info("GPM: Using OPeNDAP spatial subset — bbox only, ~50-200 KB per file")
 
     outdir = ROOT / cfg["paths"]["raw_gpm"]
     outdir.mkdir(parents=True, exist_ok=True)
@@ -265,72 +331,73 @@ def download_gpm(cfg, start_override=None, end_override=None,
 
     session = _build_session(token)
 
-    # Step 2: verify listing for start date
-    log.info("GPM: Verifying directory listing for %s...", start_dt)
+    # Step 2: verify listing for first date range start
+    first_start = date_ranges[0][0]
+    log.info("GPM: Verifying directory listing for %s...", first_start)
     try:
-        files = _list_day_files(session, start_dt)
+        files = _list_day_files(session, first_start)
     except RuntimeError as e:
         log.error("GPM: Listing failed: %s", e)
         return False
-
     if not files:
-        log.error("GPM: No HDF5 files listed for %s.", start_dt)
+        log.error("GPM: No HDF5 files listed for %s.", first_start)
         return False
+    log.info("GPM: Access verified. Found %d files for %s.", len(files), first_start)
 
-    log.info("GPM: Found %d files for %s. First: %s", len(files), start_dt, files[0])
-
-    # Step 3: test-one mode — download first file only, then stop
+    # Step 3: test-one mode
     if test_one:
-        fname    = files[0]
-        day_dir  = outdir / str(start_dt.year) / start_dt.strftime("%j")
+        fname   = files[0]
+        day_dir = outdir / str(first_start.year) / first_start.strftime("%j")
         day_dir.mkdir(parents=True, exist_ok=True)
         try:
-            fpath = _download_one_file(session, start_dt, fname, day_dir)
-            log.info("GPM TEST-ONE: SUCCESS — %s (%.2f MB)",
-                     fpath.name, fpath.stat().st_size / 1e6)
-            _verify_hdf5_content(fpath)
+            fpath = _download_one_file(session, first_start, fname, day_dir, bbox=bbox)
+            log.info("GPM TEST-ONE: SUCCESS — %s (%.1f KB)",
+                     fpath.name, fpath.stat().st_size / 1e3)
             return True
         except RuntimeError as e:
             log.error("GPM TEST-ONE: FAILED — %s", e)
             return False
 
-    # Step 4: full date range download
+    # Step 4: download all date ranges
     total_files = 0
     total_bytes = 0
-    current = start_dt
 
-    while current <= end_dt:
-        day_dir = outdir / str(current.year) / current.strftime("%j")
-        day_dir.mkdir(parents=True, exist_ok=True)
+    for start_dt, end_dt in date_ranges:
+        current = start_dt
+        while current <= end_dt:
+            day_dir = outdir / str(current.year) / current.strftime("%j")
+            day_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            files = _list_day_files(session, current)
-        except RuntimeError as e:
-            log.error("GPM: Listing failed for %s: %s", current, e)
-            current += datetime.timedelta(days=1)
-            continue
-
-        if not files:
-            current += datetime.timedelta(days=1)
-            continue
-
-        day_bytes = 0
-        for fname in files:
             try:
-                fpath = _download_one_file(session, current, fname, day_dir)
-                day_bytes  += fpath.stat().st_size
-                total_files += 1
-                total_bytes += fpath.stat().st_size
+                day_files = _list_day_files(session, current)
             except RuntimeError as e:
-                log.error("GPM: %s", e)
-                return False
-            time.sleep(0.05)
+                log.error("GPM: Listing failed for %s: %s", current, e)
+                current += datetime.timedelta(days=1)
+                continue
 
-        log.info("GPM: %s — %d files, %.1f MB (total: %d files, %.1f MB)",
-                 current, len(files), day_bytes / 1e6, total_files, total_bytes / 1e6)
-        current += datetime.timedelta(days=1)
+            if not day_files:
+                current += datetime.timedelta(days=1)
+                continue
 
-    log.info("GPM: Download complete — %d files, %.1f MB", total_files, total_bytes / 1e6)
+            day_bytes = 0
+            for fname in day_files:
+                try:
+                    fpath = _download_one_file(session, current, fname,
+                                               day_dir, bbox=bbox)
+                    day_bytes   += fpath.stat().st_size
+                    total_files += 1
+                    total_bytes += fpath.stat().st_size
+                except RuntimeError as e:
+                    log.error("GPM: %s", e)
+                    return False
+                time.sleep(0.05)
+
+            log.info("GPM: %s — %d files, %.0f KB (total: %d files, %.1f MB)",
+                     current, len(day_files), day_bytes / 1e3,
+                     total_files, total_bytes / 1e6)
+            current += datetime.timedelta(days=1)
+
+    log.info("GPM: Download complete — %d files, %.1f MB total", total_files, total_bytes / 1e6)
     return True
 
 

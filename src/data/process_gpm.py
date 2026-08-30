@@ -43,6 +43,36 @@ OUT           = ROOT / CFG["paths"]["processed"]
 OUT.mkdir(parents=True, exist_ok=True)
 
 
+
+def parse_imerg_nc4(fpath: Path):
+    """
+    Parse an OPeNDAP-subset NetCDF4 file (.HDF5.nc4).
+
+    These are small bbox-only files downloaded via GES DISC OPeNDAP subsetting.
+    Variables: precipitation (mm/hr), lat, lon, time (GPS seconds since 1980-01-06)
+    Array order: precipitation[time=1, lon=N, lat=M]
+    """
+    import netCDF4 as nc
+    with nc.Dataset(str(fpath), "r") as ds:
+        lats   = np.array(ds.variables["lat"][:])
+        lons   = np.array(ds.variables["lon"][:])
+        t_sec  = int(ds.variables["time"][0])
+        precip = np.array(ds.variables["precipitation"][0, :, :], dtype=np.float32)
+
+    GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
+    ts = GPS_EPOCH + timedelta(seconds=t_sec)
+
+    precip[precip < -9000] = np.nan
+    lon_grid, lat_grid = np.meshgrid(lons, lats, indexing="ij")
+
+    return pd.DataFrame({
+        "timestamp":    ts,
+        "latitude":     lat_grid.flatten().astype(np.float32),
+        "longitude":    lon_grid.flatten().astype(np.float32),
+        "precip_mm_hr": precip.flatten(),
+    })
+
+
 def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):
     """
     Read one GPM IMERG V07B HDF5 file, subset to bbox, return DataFrame.
@@ -167,13 +197,19 @@ def build_environmental_grid_from_gpm(gpm_3h: pd.DataFrame) -> pd.DataFrame:
 def main():
     log.info("=== process_gpm.py ===")
 
-    # Collect all HDF5 files
+    # Collect GPM files — OPeNDAP subsets (.HDF5.nc4) preferred, fall back to full HDF5
+    nc4_files  = sorted(RAW_GPM.rglob("*.HDF5.nc4"))
     hdf5_files = sorted(RAW_GPM.rglob("*.HDF5"))
-    if not hdf5_files:
-        log.error("No HDF5 files found in %s. Run download_data.py --source gpm first.", RAW_GPM)
+    # Exclude any HDF5 that already has a nc4 subset (avoid duplicates)
+    hdf5_only  = [f for f in hdf5_files if not (f.parent / (f.name + ".nc4")).exists()]
+
+    all_files = nc4_files + hdf5_only
+    if not all_files:
+        log.error("No GPM files found in %s. Run download_data.py --source gpm first.", RAW_GPM)
         return 1
 
-    log.info("Found %d HDF5 files in %s", len(hdf5_files), RAW_GPM)
+    log.info("Found %d GPM files (%d OPeNDAP subsets, %d full HDF5) in %s",
+             len(all_files), len(nc4_files), len(hdf5_only), RAW_GPM)
 
     try:
         import h5py
@@ -186,16 +222,18 @@ def main():
     lat_min, lat_max = BBOX["lat_min"], BBOX["lat_max"]
     lon_min, lon_max = BBOX["lon_min"], BBOX["lon_max"]
 
-    for i, fpath in enumerate(hdf5_files):
-        if i % 48 == 0:
-            log.info("  Parsing file %d/%d: %s", i + 1, len(hdf5_files), fpath.name)
+    for i, fpath in enumerate(all_files):
+        if i % 480 == 0:
+            log.info("  Parsing file %d/%d: %s", i + 1, len(all_files), fpath.name)
         try:
-            df = parse_imerg_hdf5(fpath, lat_min, lat_max, lon_min, lon_max)
+            if fpath.suffix == ".nc4":
+                df = parse_imerg_nc4(fpath)
+            else:
+                df = parse_imerg_hdf5(fpath, lat_min, lat_max, lon_min, lon_max)
             if df is not None:
                 frames.append(df)
         except Exception as e:
             log.error("  Failed to parse %s: %s", fpath.name, e)
-            # Delete truncated/corrupt files so the downloader re-fetches them
             if fpath.exists():
                 fpath.unlink()
                 log.warning("  Deleted corrupt file: %s (will be re-downloaded)", fpath.name)
