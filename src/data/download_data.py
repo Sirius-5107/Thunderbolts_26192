@@ -388,6 +388,14 @@ def _verify_hdf5_content(fpath: Path):
 # ---------------------------------------------------------------------------
 
 def download_era5(cfg) -> bool:
+    """
+    Download ERA5-Land and ERA5 single-level reanalysis data.
+
+    Requests are split by year to stay within CDS size limits.
+    Files saved to: data/raw/era5/
+      era5land_<YYYY>.nc   -- total_precipitation, soil_moisture
+      era5_<YYYY>.nc       -- temperature, dewpoint, pressure, wind
+    """
     try:
         import cdsapi
     except ImportError:
@@ -397,32 +405,56 @@ def download_era5(cfg) -> bool:
     if not cdsrc.exists():
         log.warning("ERA5: ~/.cdsapirc not found. Register at https://cds.climate.copernicus.eu/")
         return False
-    import math
-    bbox  = cfg["region"]["bbox"]
-    area  = [bbox["lat_max"], bbox["lon_min"], bbox["lat_min"], bbox["lon_max"]]
+
+    bbox   = cfg["region"]["bbox"]
+    area   = [bbox["lat_max"], bbox["lon_min"], bbox["lat_min"], bbox["lon_max"]]
     months = [str(m).zfill(2) for m in cfg["time"]["monsoon_months"]]
     outdir = ROOT / cfg["paths"]["raw_era5"]
     outdir.mkdir(parents=True, exist_ok=True)
+
+    start_year = int(cfg["time"]["start_date"][:4])
+    end_year   = int(cfg["time"]["end_date"][:4])
+    # Limit to 2019-2023 to match synthetic data period
+    start_year = max(start_year, 2019)
+
     c = cdsapi.Client()
-    for fname, dataset, variables in [
-        ("era5land_precipitation_monsoon.nc", "reanalysis-era5-land",
-         ["total_precipitation", "volumetric_soil_water_layer_1"]),
-        ("era5_weather_monsoon.nc", "reanalysis-era5-single-levels",
-         ["2m_temperature", "2m_dewpoint_temperature", "surface_pressure",
-          "10m_u_component_of_wind", "10m_v_component_of_wind"]),
-    ]:
-        out = outdir / fname
-        if not out.exists():
-            years = [str(y) for y in range(2019, 2024)]
-            req = {"variable": variables, "year": years, "month": months,
-                   "day": [str(d).zfill(2) for d in range(1, 32)],
-                   "time": [f"{h:02d}:00" for h in range(24)],
-                   "area": area, "format": "netcdf"}
-            if dataset == "reanalysis-era5-single-levels":
-                req["product_type"] = "reanalysis"
-            c.retrieve(dataset, req, str(out))
-        else:
-            log.info("ERA5: %s already exists.", fname)
+
+    datasets = [
+        ("era5land",   "reanalysis-era5-land",
+         ["total_precipitation", "volumetric_soil_water_layer_1"], {}),
+        ("era5",       "reanalysis-era5-single-levels",
+         ["2m_temperature", "2m_dewpoint_temperature",
+          "surface_pressure", "10m_u_component_of_wind",
+          "10m_v_component_of_wind"],
+         {"product_type": "reanalysis"}),
+    ]
+
+    for prefix, dataset, variables, extra in datasets:
+        for year in range(start_year, end_year + 1):
+            out = outdir / f"{prefix}_{year}.nc"
+            if out.exists():
+                log.info("ERA5: %s already exists, skipping.", out.name)
+                continue
+            log.info("ERA5: Requesting %s for year %d...", prefix, year)
+            req = {
+                "variable": variables,
+                "year":     [str(year)],
+                "month":    months,
+                "day":      [str(d).zfill(2) for d in range(1, 32)],
+                "time":     [f"{h:02d}:00" for h in range(0, 24, 3)],  # 3-hourly
+                "area":     area,
+                "format":   "netcdf",
+                **extra,
+            }
+            try:
+                c.retrieve(dataset, req, str(out))
+                log.info("ERA5: Saved %s (%.0f MB)", out.name, out.stat().st_size / 1e6)
+            except Exception as e:
+                log.error("ERA5: Failed for %s year %d: %s", prefix, year, e)
+                if out.exists():
+                    out.unlink()
+                return False
+
     return True
 
 

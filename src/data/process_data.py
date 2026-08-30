@@ -180,26 +180,111 @@ def process_gpm_rainfall():
 # ---------------------------------------------------------------------------
 
 def process_era5():
+    """
+    Process per-year ERA5 NetCDF files into a single aligned DataFrame.
+    Merges era5land_YYYY.nc (precip, soil) + era5_YYYY.nc (temp, dewpoint, pressure, wind).
+    Resamples to 3-hourly to match GPM grid.
+    """
     era5_dir = ROOT / CFG["paths"]["raw_era5"]
-    nc_files = list(era5_dir.rglob("*.nc"))
-    if not nc_files:
+    land_files = sorted(era5_dir.glob("era5land_*.nc"))
+    sfc_files  = sorted(era5_dir.glob("era5_*.nc"))
+
+    if not land_files and not sfc_files:
         log.warning("ERA5: No files in %s. Will use synthetic data.", era5_dir)
         return None
+
     try:
         import xarray as xr
-        frames = {}
-        for f in nc_files:
-            ds = xr.open_dataset(f)
-            ds = ds.sel(
-                latitude=slice(BBOX["lat_max"], BBOX["lat_min"]),
-                longitude=slice(BBOX["lon_min"], BBOX["lon_max"]),
-            )
+
+        def load_nc_files(files, label):
+            if not files:
+                return None
+            ds_list = []
+            for f in files:
+                ds = xr.open_dataset(f)
+                # Handle both old (latitude/longitude) and new (lat/lon) coord names
+                rename = {}
+                if "latitude" in ds.coords:  rename["latitude"]  = "lat"
+                if "longitude" in ds.coords: rename["longitude"] = "lon"
+                if rename:
+                    ds = ds.rename(rename)
+                # Subset to bbox
+                ds = ds.sel(
+                    lat=slice(BBOX["lat_min"], BBOX["lat_max"]),
+                    lon=slice(BBOX["lon_min"], BBOX["lon_max"]),
+                )
+                ds_list.append(ds)
+                log.info("ERA5 %s: loaded %s", label, f.name)
+            return xr.concat(ds_list, dim="time").sortby("time")
+
+        ds_land = load_nc_files(land_files, "land")
+        ds_sfc  = load_nc_files(sfc_files,  "sfc")
+
+        # Convert to DataFrames
+        frames = []
+        for ds, label in [(ds_land, "land"), (ds_sfc, "sfc")]:
+            if ds is None:
+                continue
             df = ds.to_dataframe().reset_index()
-            frames[f.stem] = df
-            log.info("ERA5: %s shape=%s", f.name, df.shape)
-        return frames
+            # Standardise time column name
+            if "valid_time" in df.columns:
+                df = df.rename(columns={"valid_time": "time"})
+            df["time"] = pd.to_datetime(df["time"])
+            frames.append(df)
+            log.info("ERA5 %s: %d rows, %s to %s",
+                     label, len(df), df["time"].min(), df["time"].max())
+
+        if not frames:
+            return None
+
+        # Merge land + sfc on time + lat + lon
+        result = frames[0]
+        for extra in frames[1:]:
+            merge_keys = [k for k in ["time", "lat", "lon"] if k in result.columns and k in extra.columns]
+            result = result.merge(extra, on=merge_keys, how="outer")
+
+        # Rename to standard column names
+        rename_map = {
+            "tp":    "precip_era5_m",   # ERA5 precip in metres
+            "swvl1": "soil_moisture_m3m3",
+            "t2m":   "temperature_2m_k",
+            "d2m":   "dewpoint_2m_k",
+            "sp":    "pressure_pa",
+            "u10":   "u10_ms",
+            "v10":   "v10_ms",
+            "lat":   "latitude",
+            "lon":   "longitude",
+            "time":  "timestamp",
+        }
+        result = result.rename(columns={k: v for k, v in rename_map.items() if k in result.columns})
+
+        # Unit conversions
+        if "temperature_2m_k" in result.columns:
+            result["temperature_2m_c"] = result["temperature_2m_k"] - 273.15
+        if "pressure_pa" in result.columns:
+            result["pressure_hpa"] = result["pressure_pa"] / 100.0
+        if "dewpoint_2m_k" in result.columns and "temperature_2m_k" in result.columns:
+            # Magnus formula: relative humidity from dewpoint
+            T  = result["temperature_2m_k"] - 273.15
+            Td = result["dewpoint_2m_k"] - 273.15
+            result["humidity_pct"] = 100 * (
+                (17.625 * Td) / (243.04 + Td)
+            ).pipe(lambda x: x - (17.625 * T) / (243.04 + T)).apply(lambda x: min(100, max(0, 100 * (2.718281828 ** (x)))))
+        if "precip_era5_m" in result.columns:
+            # Convert from metres/hour to mm (already accumulated per timestep for ERA5)
+            result["precip_era5_mm"] = result["precip_era5_m"] * 1000
+
+        log.info("ERA5: merged %d rows with columns: %s",
+                 len(result), [c for c in result.columns if c not in ("latitude","longitude","timestamp")])
+
+        out = ROOT / CFG["paths"]["processed"] / "era5_processed.parquet"
+        result.to_parquet(out, index=False)
+        log.info("ERA5: saved -> %s", out)
+        return result
+
     except Exception as e:
         log.error("ERA5 processing error: %s", e)
+        import traceback; traceback.print_exc()
         return None
 
 
@@ -413,14 +498,35 @@ def main():
 
     if rainfall_ok is not None:
         log.info("Building environmental_grid from real GPM data...")
-        env_df = rainfall_ok.rename(columns={"precip_3h_mm": "precip_3h_mm"}).copy()
-        env_df["temperature_2m_c"]  = float("nan")
-        env_df["humidity_pct"]       = float("nan")
-        env_df["pressure_hpa"]       = float("nan")
-        env_df["soil_moisture_m3m3"] = float("nan")
-        env_df["data_source"]        = "GPM_IMERG_V07"
+        env_df = rainfall_ok.copy()
+        env_df["data_source"] = "GPM_IMERG_V07"
+
+        # Merge ERA5 weather columns if available
+        if era5_ok is not None:
+            log.info("Merging ERA5 weather into environmental grid...")
+            era5_cols = ["timestamp", "latitude", "longitude",
+                         "temperature_2m_c", "humidity_pct",
+                         "pressure_hpa", "soil_moisture_m3m3"]
+            era5_sub = era5_ok[[c for c in era5_cols if c in era5_ok.columns]].copy()
+            era5_sub["timestamp"] = pd.to_datetime(era5_sub["timestamp"]).dt.floor("3h")
+            era5_sub["latitude"]  = era5_sub["latitude"].round(1)
+            era5_sub["longitude"] = era5_sub["longitude"].round(1)
+            era5_sub = era5_sub.drop_duplicates(["timestamp", "latitude", "longitude"])
+            env_df["latitude"]  = env_df["latitude"].round(1)
+            env_df["longitude"] = env_df["longitude"].round(1)
+            env_df = env_df.merge(era5_sub, on=["timestamp", "latitude", "longitude"], how="left")
+            fill_pct = 100 * env_df["temperature_2m_c"].notna().mean() if "temperature_2m_c" in env_df.columns else 0
+            log.info("ERA5 merge: temperature fill=%.1f%%", fill_pct)
+            env_df["data_source"] = "GPM_IMERG_V07+ERA5"
+        else:
+            env_df["temperature_2m_c"]  = float("nan")
+            env_df["humidity_pct"]       = float("nan")
+            env_df["pressure_hpa"]       = float("nan")
+            env_df["soil_moisture_m3m3"] = float("nan")
+
         env_df.to_parquet(gpm_env_out, index=False)
-        log.info("Environmental grid (GPM): %d rows -> %s", len(env_df), gpm_env_out.name)
+        log.info("Environmental grid: %d rows -> %s (source: %s)",
+                 len(env_df), gpm_env_out.name, env_df["data_source"].iloc[0])
     elif not gpm_env_out.exists():
         log.info("Real data unavailable. Generating synthetic data.")
         generate_synthetic_environmental_data(labels_df=labels_df)
