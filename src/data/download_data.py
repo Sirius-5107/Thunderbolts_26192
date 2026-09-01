@@ -528,10 +528,20 @@ def download_era5(cfg, start_year_override=None, end_year_override=None) -> bool
 
 
 def download_srtm(cfg) -> bool:
-    import math
+    """
+    Download SRTM 30m individual 1-degree tiles via NASA EarthData HTTPS.
+
+    Uses the same Earthdata Bearer token as GPM (EARTHDATA_USERNAME/PASSWORD).
+    Tiles cover the full Uttarakhand bbox: N28-N31, E077-E080 (16 tiles).
+    Each tile ~25 MB zipped; total ~400 MB.
+
+    Falls back to OpenTopography API if OPENTOPO_API_KEY is set.
+    """
     bbox   = cfg["region"]["bbox"]
     outdir = ROOT / cfg["paths"]["raw_srtm"]
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Option A: OpenTopography single-file download (30m, needs API key)
     api_key = os.environ.get("OPENTOPO_API_KEY", "")
     if api_key:
         url = (f"https://portal.opentopography.org/API/globaldem?demtype=SRTMGL1"
@@ -542,33 +552,78 @@ def download_srtm(cfg) -> bool:
         if not out.exists():
             r = requests.get(url, stream=True, timeout=300)
             if r.status_code == 200:
-                with open(out, "wb") as f:
+                with open(out, "wb") as fh:
                     for chunk in r.iter_content(1024 * 1024):
-                        f.write(chunk)
-                log.info("SRTM GL1: %.1f MB", out.stat().st_size / 1e6)
+                        fh.write(chunk)
+                log.info("SRTM GL1 (OpenTopography): %.1f MB", out.stat().st_size / 1e6)
+                return True
             else:
-                log.error("SRTM GL1: HTTP %d", r.status_code)
-                return False
-        return True
-    def tile_num(lon, lat):
-        return math.floor((lon + 180) / 5) + 1, math.floor((60 - lat) / 5) + 1
-    corners = [(bbox["lon_min"], bbox["lat_max"]), (bbox["lon_max"], bbox["lat_max"]),
-               (bbox["lon_min"], bbox["lat_min"]), (bbox["lon_max"], bbox["lat_min"])]
-    for tx, ty in set(tile_num(lon, lat) for lon, lat in corners):
-        fname  = f"srtm_{tx:02d}_{ty:02d}.zip"
-        out    = outdir / fname
-        if out.exists():
-            continue
-        url = f"https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF/{fname}"
-        r = requests.get(url, stream=True, timeout=120)
-        if r.status_code == 200:
-            with open(out, "wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
-                    f.write(chunk)
-            log.info("SRTM 90m: %s %.1f MB", fname, out.stat().st_size / 1e6)
+                log.warning("OpenTopography HTTP %d, falling back to NASA tiles", r.status_code)
         else:
-            log.error("SRTM 90m: HTTP %d for %s", r.status_code, url)
-    return True
+            log.info("SRTM: %s already exists", out.name)
+            return True
+
+    # Option B: NASA EarthData SRTMGL1 individual 1-degree tiles (30m, same Earthdata auth)
+    user = os.environ.get("EARTHDATA_USERNAME", "").strip()
+    pwd  = os.environ.get("EARTHDATA_PASSWORD", "").strip()
+    if not user or not pwd:
+        log.error(
+            "SRTM: Set EARTHDATA_USERNAME/EARTHDATA_PASSWORD (same as GPM) "
+            "or OPENTOPO_API_KEY to download SRTM data."
+        )
+        return False
+
+    try:
+        token = _get_bearer_token(user, pwd)
+    except RuntimeError as e:
+        log.error("SRTM: Token fetch failed: %s", e)
+        return False
+
+    session = _build_session(token)
+
+    # 1-degree tiles covering bbox: lat 28-31N, lon 77-80E
+    lat_min_i = int(bbox["lat_min"])
+    lat_max_i = int(bbox["lat_max"])
+    lon_min_i = int(bbox["lon_min"])
+    lon_max_i = int(bbox["lon_max"])
+
+    BASE = "https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11"
+    success = True
+    total = 0
+
+    for lat in range(lat_min_i, lat_max_i + 1):
+        for lon in range(lon_min_i, lon_max_i + 1):
+            fname = f"N{lat:02d}E{lon:03d}.SRTMGL1.hgt.zip"
+            out   = outdir / fname
+            if out.exists() and out.stat().st_size > 1_000_000:
+                log.info("SRTM: %s already exists (%.0f MB)", fname, out.stat().st_size / 1e6)
+                continue
+
+            url = f"{BASE}/{fname}"
+            log.info("SRTM: Downloading %s ...", fname)
+            for attempt in range(1, 4):
+                try:
+                    r = session.get(url, stream=True, timeout=180)
+                    if r.status_code == 200:
+                        with open(out, "wb") as fh:
+                            for chunk in r.iter_content(1024 * 1024):
+                                fh.write(chunk)
+                        size_mb = out.stat().st_size / 1e6
+                        log.info("  %s: %.0f MB", fname, size_mb)
+                        total += out.stat().st_size
+                        break
+                    else:
+                        log.warning("  HTTP %d for %s (attempt %d)", r.status_code, fname, attempt)
+                        if attempt == 3:
+                            success = False
+                except Exception as e:
+                    log.warning("  Error attempt %d: %s", attempt, e)
+                    if attempt == 3:
+                        success = False
+                time.sleep(1)
+
+    log.info("SRTM: Done. %.0f MB total downloaded to %s", total / 1e6, outdir)
+    return success
 
 
 def check_events(cfg) -> bool:
