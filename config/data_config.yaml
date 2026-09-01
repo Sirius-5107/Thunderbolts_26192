@@ -12,8 +12,8 @@ region:
   elevation_range_m: [200, 7000]
 
 time:
-  start_date: "2001-01-01"
-  end_date: "2023-12-31"
+  start_date: "2018-01-01"
+  end_date: "2024-12-31"
   temporal_resolution: "3H"
   monsoon_months: [6, 7, 8, 9]
 

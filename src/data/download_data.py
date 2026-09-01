@@ -456,7 +456,7 @@ def _verify_hdf5_content(fpath: Path):
 # ERA5, SRTM, Events — unchanged
 # ---------------------------------------------------------------------------
 
-def download_era5(cfg) -> bool:
+def download_era5(cfg, start_year_override=None, end_year_override=None) -> bool:
     """
     Download ERA5-Land and ERA5 single-level reanalysis data.
 
@@ -481,10 +481,10 @@ def download_era5(cfg) -> bool:
     outdir = ROOT / cfg["paths"]["raw_era5"]
     outdir.mkdir(parents=True, exist_ok=True)
 
-    start_year = int(cfg["time"]["start_date"][:4])
-    end_year   = int(cfg["time"]["end_date"][:4])
-    # Limit to 2019-2023 to match synthetic data period
-    start_year = max(start_year, 2019)
+    start_year = start_year_override or int(cfg["time"]["start_date"][:4])
+    end_year   = end_year_override   or int(cfg["time"]["end_date"][:4])
+    # Default floor: 2018 (earliest practical ERA5 for this project)
+    start_year = max(int(start_year), 2018)
 
     c = cdsapi.Client()
 
@@ -602,7 +602,9 @@ def main():
         results["gpm"] = download_gpm(cfg, args.start, args.end,
                                        test_one=args.test_one)
     if args.source in ("all", "era5"):
-        results["era5"] = download_era5(cfg)
+        sy = int(args.start[:4]) if args.start else None
+        ey = int(args.end[:4])   if args.end   else None
+        results["era5"] = download_era5(cfg, sy, ey)
     if args.source in ("all", "srtm"):
         results["srtm"] = download_srtm(cfg)
     if args.source in ("all", "events"):

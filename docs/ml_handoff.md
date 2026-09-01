@@ -72,9 +72,9 @@ flood_label = 1 if any flood event occurred in Uttarakhand on day(T)
 
 ## Date Range
 
-- Training: 2001–2020 (20 monsoon seasons, ~336,000 rows)
-- Validation: 2021–2022 (2 seasons, ~33,600 rows)
-- Test: 2023 (1 season, ~16,800 rows)
+- Training: 2018–2022 (5 monsoon seasons)
+- Validation: 2023 (1 season — tune hyperparameters here)
+- Test: 2024 (1 season — final evaluation only, never touch during training)
 
 ---
 
@@ -88,9 +88,9 @@ Random splitting causes data leakage because:
 
 ```python
 df['year'] = pd.to_datetime(df['timestamp']).dt.year
-train = df[df['year'] <= 2020]
-val   = df[df['year'].isin([2021, 2022])]
-test  = df[df['year'] == 2023]
+train = df[df['year'] <= 2022]
+val   = df[df['year'] == 2023]
+test  = df[df['year'] == 2024]
 ```
 
 ---
