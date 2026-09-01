@@ -587,42 +587,84 @@ def download_srtm(cfg) -> bool:
     lon_min_i = int(bbox["lon_min"])
     lon_max_i = int(bbox["lon_max"])
 
-    BASE = "https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11"
+    # Try multiple NASA LP DAAC URL patterns (endpoint changes between versions)
+    # Pattern 1: current LP DAAC format (V003, .hgt.zip)
+    # Pattern 2: alternate extension (.SRTMGL1.hgt.zip)
+    # Pattern 3: AWS open terrain tiles (no auth needed)
     success = True
-    total = 0
+    total   = 0
+
+    # AWS Terrain Tiles (Mapzen/Tilezen) — completely open, no auth needed
+    # Format: https://s3.amazonaws.com/elevation-tiles-prod/skadi/{LAT_DIR}/{TILE}.hgt.gz
+    # This is the most reliable public SRTM source
+    AWS_BASE = "https://s3.amazonaws.com/elevation-tiles-prod/skadi"
+
+    # NASA LP DAAC — requires Earthdata auth, try if AWS fails
+    NASA_BASES = [
+        "https://e4ftl01.cr.usgs.gov/MEASURES/SRTMGL1.003/2000.02.11",
+        "https://e4ftl01.cr.usgs.gov/SRTM/SRTMGL1.003/2000.02.11",
+    ]
 
     for lat in range(lat_min_i, lat_max_i + 1):
         for lon in range(lon_min_i, lon_max_i + 1):
-            fname = f"N{lat:02d}E{lon:03d}.SRTMGL1.hgt.zip"
-            out   = outdir / fname
-            if out.exists() and out.stat().st_size > 1_000_000:
-                log.info("SRTM: %s already exists (%.0f MB)", fname, out.stat().st_size / 1e6)
+            lat_dir = f"N{lat:02d}"
+            tile    = f"N{lat:02d}E{lon:03d}"
+            out_gz  = outdir / f"{tile}.hgt.gz"
+            out_zip = outdir / f"{tile}.SRTMGL1.hgt.zip"
+
+            # Skip if already downloaded (either format)
+            if (out_gz.exists()  and out_gz.stat().st_size  > 100_000) or                (out_zip.exists() and out_zip.stat().st_size > 100_000):
+                log.info("SRTM: %s already exists", tile)
                 continue
 
-            url = f"{BASE}/{fname}"
-            log.info("SRTM: Downloading %s ...", fname)
-            for attempt in range(1, 4):
-                try:
-                    r = session.get(url, stream=True, timeout=180)
-                    if r.status_code == 200:
-                        with open(out, "wb") as fh:
-                            for chunk in r.iter_content(1024 * 1024):
-                                fh.write(chunk)
-                        size_mb = out.stat().st_size / 1e6
-                        log.info("  %s: %.0f MB", fname, size_mb)
-                        total += out.stat().st_size
-                        break
-                    else:
-                        log.warning("  HTTP %d for %s (attempt %d)", r.status_code, fname, attempt)
-                        if attempt == 3:
-                            success = False
-                except Exception as e:
-                    log.warning("  Error attempt %d: %s", attempt, e)
-                    if attempt == 3:
-                        success = False
-                time.sleep(1)
+            downloaded = False
 
-    log.info("SRTM: Done. %.0f MB total downloaded to %s", total / 1e6, outdir)
+            # Try 1: AWS open terrain tiles (no auth)
+            aws_url = f"{AWS_BASE}/{lat_dir}/{tile}.hgt.gz"
+            try:
+                r = requests.get(aws_url, stream=True, timeout=60)
+                if r.status_code == 200:
+                    with open(out_gz, "wb") as fh:
+                        for chunk in r.iter_content(512 * 1024):
+                            fh.write(chunk)
+                    log.info("SRTM: %s %.0f MB (AWS)", tile, out_gz.stat().st_size / 1e6)
+                    total += out_gz.stat().st_size
+                    downloaded = True
+            except Exception as e:
+                log.debug("SRTM AWS attempt failed for %s: %s", tile, e)
+
+            if downloaded:
+                continue
+
+            # Try 2: NASA LP DAAC (requires Earthdata auth)
+            for base in NASA_BASES:
+                for ext in [".SRTMGL1.hgt.zip", ".hgt.zip"]:
+                    fname = f"{tile}{ext}"
+                    url   = f"{base}/{fname}"
+                    out_f = outdir / fname
+                    try:
+                        r = session.get(url, stream=True, timeout=180)
+                        if r.status_code == 200:
+                            with open(out_f, "wb") as fh:
+                                for chunk in r.iter_content(1024 * 1024):
+                                    fh.write(chunk)
+                            if out_f.stat().st_size > 100_000:
+                                log.info("SRTM: %s %.0f MB (NASA)", fname, out_f.stat().st_size / 1e6)
+                                total += out_f.stat().st_size
+                                downloaded = True
+                                break
+                            else:
+                                out_f.unlink()
+                    except Exception as e:
+                        log.debug("SRTM NASA attempt failed: %s", e)
+                if downloaded:
+                    break
+
+            if not downloaded:
+                log.warning("SRTM: Could not download tile %s from any source", tile)
+                success = False
+
+    log.info("SRTM: Done. %.0f MB total -> %s", total / 1e6, outdir)
     return success
 
 

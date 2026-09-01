@@ -293,10 +293,35 @@ def process_era5():
 # ---------------------------------------------------------------------------
 
 def process_srtm():
-    srtm_dir = ROOT / CFG["paths"]["raw_srtm"]
+    srtm_dir  = ROOT / CFG["paths"]["raw_srtm"]
     tif_files = list(srtm_dir.rglob("*.tif"))
+    gz_files  = list(srtm_dir.rglob("*.hgt.gz"))
+    zip_files = list(srtm_dir.rglob("*.hgt.zip"))
+
+    # Unpack .gz and .zip files into .hgt so rasterio can read them
+    if gz_files:
+        import gzip, shutil
+        for gz in gz_files:
+            hgt = gz.with_suffix("")  # removes .gz -> .hgt
+            if not hgt.exists():
+                log.info("SRTM: Unpacking %s", gz.name)
+                with gzip.open(gz, "rb") as fin, open(hgt, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+        tif_files += list(srtm_dir.rglob("*.hgt"))
+
+    if zip_files:
+        import zipfile
+        for zf in zip_files:
+            log.info("SRTM: Unpacking %s", zf.name)
+            with zipfile.ZipFile(zf, "r") as z:
+                z.extractall(srtm_dir)
+        tif_files += list(srtm_dir.rglob("*.hgt"))
+
+    # Deduplicate
+    tif_files = list(set(tif_files))
+
     if not tif_files:
-        log.warning("SRTM: No GeoTIFF in %s. Will use synthetic terrain.", srtm_dir)
+        log.warning("SRTM: No terrain files in %s. Will use synthetic terrain.", srtm_dir)
         return None
     try:
         import rasterio
