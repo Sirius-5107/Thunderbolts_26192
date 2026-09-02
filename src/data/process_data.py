@@ -209,7 +209,7 @@ def process_era5():
                 return None
             ds_list = []
             for f in files:
-                ds = xr.open_dataset(f)
+                ds = xr.open_dataset(f, engine="netcdf4")
                 # Handle both old (latitude/longitude) and new (lat/lon) coord names
                 rename = {}
                 if "latitude" in ds.coords:  rename["latitude"]  = "lat"
