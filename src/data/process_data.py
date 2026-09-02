@@ -190,109 +190,116 @@ def process_gpm_rainfall():
 def process_era5():
     """
     Process per-year ERA5 NetCDF files into a single aligned DataFrame.
-    Merges era5land_YYYY.nc (precip, soil) + era5_YYYY.nc (temp, dewpoint, pressure, wind).
-    Resamples to 3-hourly to match GPM grid.
+    Handles both ZIP-wrapped and plain NetCDF4/HDF5 ERA5 files from CDS.
     """
-    era5_dir = ROOT / CFG["paths"]["raw_era5"]
+    era5_dir   = ROOT / CFG["paths"]["raw_era5"]
     land_files = sorted(era5_dir.glob("era5land_*.nc"))
     sfc_files  = sorted(era5_dir.glob("era5_*.nc"))
 
     if not land_files and not sfc_files:
-        log.warning("ERA5: No files in %s. Will use synthetic data.", era5_dir)
+        log.warning("ERA5: No files in %s. Skipping.", era5_dir)
         return None
 
     try:
-        import xarray as xr
+        def nc_to_df(fpath):
+            """Open one ERA5 NetCDF file and return a flat DataFrame."""
+            import netCDF4 as nc4
+            import numpy as np
 
-        def load_nc_files(files, label):
-            if not files:
-                return None
-            ds_list = []
-            for f in files:
-                ds = xr.open_dataset(f, engine="netcdf4")
-                # Handle both old (latitude/longitude) and new (lat/lon) coord names
-                rename = {}
-                if "latitude" in ds.coords:  rename["latitude"]  = "lat"
-                if "longitude" in ds.coords: rename["longitude"] = "lon"
-                if rename:
-                    ds = ds.rename(rename)
-                # Subset to bbox
-                ds = ds.sel(
-                    lat=slice(BBOX["lat_min"], BBOX["lat_max"]),
-                    lon=slice(BBOX["lon_min"], BBOX["lon_max"]),
-                )
-                ds_list.append(ds)
-                log.info("ERA5 %s: loaded %s", label, f.name)
-            return xr.concat(ds_list, dim="time").sortby("time")
+            ds = nc4.Dataset(str(fpath), "r")
 
-        ds_land = load_nc_files(land_files, "land")
-        ds_sfc  = load_nc_files(sfc_files,  "sfc")
+            # Read time — stored as numeric offset; decode via units attribute
+            t_var  = ds.variables["time"] if "time" in ds.variables else ds.variables.get("valid_time")
+            if t_var is None:
+                ds.close(); return None
 
-        # Convert to DataFrames
-        frames = []
-        for ds, label in [(ds_land, "land"), (ds_sfc, "sfc")]:
-            if ds is None:
-                continue
-            df = ds.to_dataframe().reset_index()
-            # Standardise time column name
-            if "valid_time" in df.columns:
-                df = df.rename(columns={"valid_time": "time"})
-            # Handle component time columns (year/month/day/hour dict-like)
-            if "time" in df.columns:
-                try:
-                    df["time"] = pd.to_datetime(df["time"])
-                except (ValueError, TypeError):
-                    # ERA5 sometimes stores time as cftime objects
-                    import cftime
-                    df["time"] = pd.to_datetime([
-                        str(t) for t in df["time"]
-                    ], errors="coerce")
-            frames.append(df)
-            log.info("ERA5 %s: %d rows, %s to %s",
-                     label, len(df), df["time"].min(), df["time"].max())
+            t_units  = getattr(t_var, "units", "hours since 1900-01-01")
+            t_cal    = getattr(t_var, "calendar", "standard")
+            import cftime
+            times_cf = cftime.num2date(t_var[:], units=t_units, calendar=t_cal)
+            timestamps = pd.to_datetime([
+                f"{d.year:04d}-{d.month:02d}-{d.day:02d} {d.hour:02d}:{d.minute:02d}"
+                for d in times_cf
+            ])
 
-        if not frames:
+            lat = ds.variables["latitude"][:] if "latitude" in ds.variables else ds.variables["lat"][:]
+            lon = ds.variables["longitude"][:] if "longitude" in ds.variables else ds.variables["lon"][:]
+
+            # Spatial subset
+            lat_mask = (lat >= BBOX["lat_min"]) & (lat <= BBOX["lat_max"])
+            lon_mask = (lon >= BBOX["lon_min"]) & (lon <= BBOX["lon_max"])
+            lat_sub  = lat[lat_mask]
+            lon_sub  = lon[lon_mask]
+            lat_idx  = np.where(lat_mask)[0]
+            lon_idx  = np.where(lon_mask)[0]
+
+            data_vars = [v for v in ds.variables
+                         if v not in ("time", "valid_time", "latitude", "longitude", "lat", "lon",
+                                      "expver", "number")]
+
+            records = []
+            for t_i, ts in enumerate(timestamps):
+                for la_i, la in zip(lat_idx, lat_sub):
+                    for lo_i, lo in zip(lon_idx, lon_sub):
+                        row = {"timestamp": ts,
+                               "latitude":  round(float(la), 2),
+                               "longitude": round(float(lo), 2)}
+                        for vname in data_vars:
+                            v = ds.variables[vname]
+                            val = float(v[t_i, la_i, lo_i]) if v.ndim == 3 else float(v[t_i])
+                            row[vname] = val
+                        records.append(row)
+
+            ds.close()
+            return pd.DataFrame(records)
+
+        log.info("ERA5: Processing %d land + %d sfc files...", len(land_files), len(sfc_files))
+
+        land_dfs = []
+        for f in land_files:
+            df = nc_to_df(f)
+            if df is not None and len(df):
+                land_dfs.append(df)
+                log.info("ERA5 land: %s  %d rows", f.name, len(df))
+
+        sfc_dfs = []
+        for f in sfc_files:
+            df = nc_to_df(f)
+            if df is not None and len(df):
+                sfc_dfs.append(df)
+                log.info("ERA5 sfc: %s  %d rows", f.name, len(df))
+
+        if not land_dfs and not sfc_dfs:
+            log.warning("ERA5: No data extracted from any file.")
             return None
 
-        # Merge land + sfc on time + lat + lon
-        result = frames[0]
-        for extra in frames[1:]:
-            merge_keys = [k for k in ["time", "lat", "lon"] if k in result.columns and k in extra.columns]
-            result = result.merge(extra, on=merge_keys, how="outer")
+        land_all = pd.concat(land_dfs, ignore_index=True) if land_dfs else None
+        sfc_all  = pd.concat(sfc_dfs,  ignore_index=True) if sfc_dfs  else None
 
-        # Rename to standard column names
-        rename_map = {
-            "tp":    "precip_era5_m",   # ERA5 precip in metres
-            "swvl1": "soil_moisture_m3m3",
-            "t2m":   "temperature_2m_k",
-            "d2m":   "dewpoint_2m_k",
-            "sp":    "pressure_pa",
-            "u10":   "u10_ms",
-            "v10":   "v10_ms",
-            "lat":   "latitude",
-            "lon":   "longitude",
-            "time":  "timestamp",
-        }
-        result = result.rename(columns={k: v for k, v in rename_map.items() if k in result.columns})
+        if land_all is not None and sfc_all is not None:
+            result = land_all.merge(sfc_all, on=["timestamp","latitude","longitude"], how="outer")
+        elif land_all is not None:
+            result = land_all
+        else:
+            result = sfc_all
 
         # Unit conversions
-        if "temperature_2m_k" in result.columns:
-            result["temperature_2m_c"] = result["temperature_2m_k"] - 273.15
-        if "pressure_pa" in result.columns:
-            result["pressure_hpa"] = result["pressure_pa"] / 100.0
-        if "dewpoint_2m_k" in result.columns and "temperature_2m_k" in result.columns:
-            # Magnus formula: relative humidity from dewpoint
-            T  = result["temperature_2m_k"] - 273.15
-            Td = result["dewpoint_2m_k"] - 273.15
-            result["humidity_pct"] = 100 * (
-                (17.625 * Td) / (243.04 + Td)
-            ).pipe(lambda x: x - (17.625 * T) / (243.04 + T)).apply(lambda x: min(100, max(0, 100 * (2.718281828 ** (x)))))
-        if "precip_era5_m" in result.columns:
-            # Convert from metres/hour to mm (already accumulated per timestep for ERA5)
-            result["precip_era5_mm"] = result["precip_era5_m"] * 1000
+        if "t2m"   in result.columns: result["temperature_2m_c"] = result["t2m"]   - 273.15
+        if "d2m"   in result.columns:
+            T  = result.get("t2m", result.get("temperature_2m_c", pd.Series(dtype=float))) - 273.15
+            Td = result["d2m"] - 273.15
+            result["humidity_pct"] = 100 * np.exp((17.625*Td)/(243.04+Td) - (17.625*T)/(243.04+T))
+            result["humidity_pct"] = result["humidity_pct"].clip(0, 100)
+        if "sp"    in result.columns: result["pressure_hpa"]       = result["sp"] / 100.0
+        if "swvl1" in result.columns: result["soil_moisture_m3m3"] = result["swvl1"]
 
-        log.info("ERA5: merged %d rows with columns: %s",
-                 len(result), [c for c in result.columns if c not in ("latitude","longitude","timestamp")])
+        # Keep only needed columns
+        keep = ["timestamp","latitude","longitude",
+                "temperature_2m_c","humidity_pct","pressure_hpa","soil_moisture_m3m3"]
+        result = result[[c for c in keep if c in result.columns]]
+
+        log.info("ERA5: %d rows | %s to %s",
+                 len(result), result["timestamp"].min(), result["timestamp"].max())
 
         out = ROOT / CFG["paths"]["processed"] / "era5_processed.parquet"
         result.to_parquet(out, index=False)
