@@ -135,7 +135,14 @@ def process_gpm_rainfall():
     """
     gpm_parquet = OUT / "gpm_rainfall.parquet"
     gpm_dir     = ROOT / CFG["paths"]["raw_gpm"]
-    hdf5_files  = list(gpm_dir.rglob("*.HDF5"))
+    # Must match BOTH layouts. rglob("*.HDF5") does not match "*.HDF5.nc4",
+    # because glob compares the whole filename and the OPeNDAP subsets end in
+    # ".nc4". With a subset-only download that made this list empty and the
+    # function fell through to the synthetic-data branch below, silently
+    # producing a fake dataset from real downloads. Quarantined files excluded.
+    quarantine  = gpm_dir / "_quarantine"
+    hdf5_files  = [f for f in list(gpm_dir.rglob("*.HDF5")) + list(gpm_dir.rglob("*.HDF5.nc4"))
+                   if quarantine not in f.parents]
 
     # Case 1: raw HDF5 files present — check if parquet is up-to-date
     if hdf5_files:
@@ -171,7 +178,8 @@ def process_gpm_rainfall():
             log.error("GPM IMERG: process_gpm.py failed.")
             return None
 
-    log.warning("GPM IMERG: No HDF5 files in %s. Will use synthetic data.", gpm_dir)
+    log.warning("GPM IMERG: No GPM granules (*.HDF5 or *.HDF5.nc4) in %s. "
+                "Will use SYNTHETIC data — this is NOT real rainfall.", gpm_dir)
     return None
 
 

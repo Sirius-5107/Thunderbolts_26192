@@ -1,27 +1,46 @@
 """
 process_gpm.py
 --------------
-Processes downloaded NASA GPM IMERG HDF5 files into the project's
-environmental-grid format (3-hourly, 0.1-deg, Uttarakhand bbox).
+Processes downloaded NASA GPM IMERG files into the project's environmental-grid
+format (3-hourly, 0.1-deg, Uttarakhand bbox).
 
-Input:  data/raw/gpm/YYYY/DOY/3B-HHR.MS.MRG.3IMERG.*.HDF5
+Input:  data/raw/gpm/**/3B-HHR.MS.MRG.3IMERG.*.HDF5       (full granules)
+        data/raw/gpm/**/3B-HHR.MS.MRG.3IMERG.*.HDF5.nc4   (OPeNDAP bbox subsets)
 Output: data/processed/gpm_rainfall.parquet
-        data/processed/environmental_grid.parquet  (GPM-based, replaces synthetic)
+        data/processed/environmental_grid.parquet
 
-GPM IMERG V07 HDF5 structure:
-  /Grid/precipitationCal   -- calibrated precip (mm/hr), shape (time, lon, lat)
-  /Grid/lon                -- 0.1-deg centres, global
-  /Grid/lat                -- 0.1-deg centres, global
-  /Grid/time               -- seconds since 1970-01-01 00:00:00 UTC
+TWO FILE LAYOUTS
+----------------
+A full granule (direct HTTPS download) keeps the HDF5 group hierarchy:
+    /Grid/precipitation   (time, lon, lat)  shape (1, 3600, 1800)
+    /Grid/lat  /Grid/lon  /Grid/time
+
+An OPeNDAP subset (.HDF5.nc4) is still HDF5 by magic bytes, but Hyrax's DAP2
+response FLATTENS the group hierarchy. There is no "Grid" group at all:
+    precipitation   (time, lon, lat)  shape (1, n_lon, n_lat)   root level
+    lat  lon  time                                              root level
+The dataset keeps attrs fullnamepath="/Grid/precipitation" and
+DimensionNames="time,lon,lat", which is how the layout is detected.
+
+Reading a subset via hf["Grid"] raises
+    "Unable to synchronously open object (object 'Grid' doesn't exist)"
+That is a LAYOUT MISMATCH, not corruption. Unreadable files are moved to
+data/raw/gpm/_quarantine/ and are never deleted.
+
+Units: IMERG `precipitation` is a RATE in mm/hr. Each granule covers 30 min,
+so depth_mm = rate * 0.5. Six granules sum to one 3-hourly accumulation.
 
 Usage:
   python src/data/process_gpm.py
-
-Run after download_data.py --source gpm
+  python src/data/process_gpm.py --dry-run     # inspect layouts, write nothing
+  python src/data/process_gpm.py --all-months  # skip the monsoon-month filter
 """
 
+import argparse
 import logging
-from datetime import datetime, timezone, timedelta
+import re
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -33,269 +52,325 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
-CFG  = yaml.safe_load(open(ROOT / "config" / "data_config.yaml"))
+CFG = yaml.safe_load(open(ROOT / "config" / "data_config.yaml"))
 
-BBOX          = CFG["region"]["bbox"]
-RES           = CFG["region"]["grid_resolution_deg"]
-MONSOON_MONTHS = CFG["time"]["monsoon_months"]
-RAW_GPM       = ROOT / CFG["paths"]["raw_gpm"]
-OUT           = ROOT / CFG["paths"]["processed"]
-OUT.mkdir(parents=True, exist_ok=True)
+BBOX = CFG["region"]["bbox"]
+RES = CFG["region"]["grid_resolution_deg"]
+MONSOON_MONTHS = set(CFG["time"]["monsoon_months"])
+
+# Reproduce the GES DISC OPeNDAP subsetter's cell selection exactly.
+#
+# A request for lat 28.5-31.5 returns centres 28.55...31.55 (31 rows). It is
+# NOT a symmetric half-cell tolerance: 28.45 is excluded but 31.55 is kept.
+# The rule that reproduces it is  min < centre < max + RES.
+#
+# This matters because full granules are clipped here while subsets arrive
+# pre-clipped. Any other rule gives the two sources different grids, and every
+# full granule then fails as a grid mismatch.
+EPS = 1e-6
+RAW_GPM = ROOT / CFG["paths"]["raw_gpm"]
+OUT = ROOT / CFG["paths"]["processed"]
+QUARANTINE = RAW_GPM / "_quarantine"
+
+FILL_THRESHOLD = -9000.0   # IMERG _FillValue is -9999.9
+
+# 3B-HHR.MS.MRG.3IMERG.20240601-S000000-E002959.0000.V07B.HDF5[.nc4]
+_NAME_RE = re.compile(r"3IMERG\.(\d{8})-S(\d{6})-E\d{6}")
 
 
+# --------------------------------------------------------------------------
+# Reading
+# --------------------------------------------------------------------------
 
-def parse_imerg_nc4(fpath: Path):
+def timestamp_from_name(fpath: Path) -> datetime:
     """
-    Parse an OPeNDAP-subset file (.HDF5.nc4) from GES DISC.
+    Granule start time taken from the filename.
 
-    Despite the .nc4 extension, GES DISC OPeNDAP returns HDF5 format.
-    The file contains only the requested bbox subset (~20-50 KB).
-    We detect the actual format from magic bytes and parse accordingly.
-
-    Tries h5py first (HDF5), falls back to netCDF4 library if needed.
+    Preferred over the `time` variable: unambiguous, needs no epoch
+    assumption, and present even when a subset drops the time array.
     """
-    magic = fpath.read_bytes()[:4]
-    if magic == b"\x89HDF":
-        # GES DISC OPeNDAP returned HDF5 — parse same as full file
-        # but the subset only contains bbox lat/lon range
-        return parse_imerg_hdf5(fpath,
-                                 BBOX["lat_min"], BBOX["lat_max"],
-                                 BBOX["lon_min"], BBOX["lon_max"])
-    else:
-        # Try netCDF4 (classic CDF format)
-        import netCDF4 as nc
-        with nc.Dataset(str(fpath), "r") as ds:
-            lats   = np.array(ds.variables["lat"][:])
-            lons   = np.array(ds.variables["lon"][:])
-            t_sec  = int(ds.variables["time"][0])
-            precip = np.array(ds.variables["precipitation"][0, :, :], dtype=np.float32)
-        GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
-        ts = GPS_EPOCH + timedelta(seconds=t_sec)
-        precip[precip < -9000] = np.nan
-        lon_grid, lat_grid = np.meshgrid(lons, lats, indexing="ij")
-        return pd.DataFrame({
-            "timestamp":    ts,
-            "latitude":     lat_grid.flatten().astype(np.float32),
-            "longitude":    lon_grid.flatten().astype(np.float32),
-            "precip_mm_hr": precip.flatten(),
-        })
+    m = _NAME_RE.search(fpath.name)
+    if not m:
+        raise ValueError(f"cannot parse IMERG timestamp from filename: {fpath.name}")
+    return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
 
 
-def parse_imerg_hdf5(fpath: Path, lat_min, lat_max, lon_min, lon_max):
+def _axis_order(dset, n_lat: int, n_lon: int) -> str:
     """
-    Read one GPM IMERG V07B HDF5 file, subset to bbox, return DataFrame.
+    Decide whether the array is lat-major or lon-major.
 
-    V07B structure (differs from V06):
-      Dataset : /Grid/precipitation        (V06: /Grid/precipitationCal)
-      Axes    : (time, lat, lon)  shape (1, 1800, 3600)
-                (V06 was (time, lon, lat))
-      Units   : mm/hr (instantaneous rate at 30-min window centre)
-      Fill    : -9999.9
+    Trusts DimensionNames when present, otherwise matches the array shape
+    against the coordinate lengths.
+    """
+    dims = dset.attrs.get("DimensionNames")
+    if dims is not None:
+        if isinstance(dims, bytes):
+            dims = dims.decode()
+        dims = str(dims).replace(" ", "").lower()
+        if dims == "time,lat,lon":
+            return "lat_major"
+        if dims == "time,lon,lat":
+            return "lon_major"
 
-    Returns columns: timestamp, latitude, longitude, precip_mm_hr
+    shape = tuple(s for s in dset.shape if s != 1)
+    if shape == (n_lat, n_lon):
+        return "lat_major"
+    if shape == (n_lon, n_lat):
+        return "lon_major"
+    if n_lat == n_lon:
+        return "lon_major"   # square subset, no attribute: IMERG native order
+    raise ValueError(f"shape {dset.shape} matches neither "
+                     f"({n_lat},{n_lon}) nor ({n_lon},{n_lat})")
+
+
+def read_imerg(fpath: Path):
+    """
+    Read one IMERG granule, full or OPeNDAP subset.
+
+    Returns (precip[lat, lon] in mm/hr with NaN fill, lats ascending,
+    lons ascending), subset to the configured bbox.
     """
     import h5py
+
     with h5py.File(fpath, "r") as hf:
-        grp = hf["Grid"]
+        grp = hf["Grid"] if "Grid" in hf else hf   # flattened DAP2 has no Grid
 
-        # Coordinates — global 0.1-deg grid
-        lats = grp["lat"][:]   # shape (1800,)  south->north
-        lons = grp["lon"][:]   # shape (3600,)  west->east
+        dset = None
+        for name in ("precipitation", "precipitationCal"):
+            if name in grp:
+                dset = grp[name]
+                break
+        if dset is None:
+            raise KeyError(f"no precipitation variable; keys = {list(grp.keys())}")
 
-        # Spatial mask
-        lat_idx = np.where((lats >= lat_min) & (lats <= lat_max))[0]
-        lon_idx = np.where((lons >= lon_min) & (lons <= lon_max))[0]
+        # Round to the 0.1-deg grid. Subsets store coordinates as float32
+        # (81.05 comes back as 81.049995 or 81.050003 depending on the file),
+        # and full granules as float64. Without rounding, the same physical
+        # cell gets two different keys and groupby splits it in two.
+        lats = np.round(np.asarray(grp["lat"][:], dtype=np.float64), 3)
+        lons = np.round(np.asarray(grp["lon"][:], dtype=np.float64), 3)
 
-        if lat_idx.size == 0 or lon_idx.size == 0:
-            log.warning("No grid points in bbox for %s", fpath.name)
-            return None
+        order = _axis_order(dset, lats.size, lons.size)
+        arr = np.squeeze(np.asarray(dset[:], dtype=np.float32))
+        if order == "lon_major":
+            arr = arr.T                             # -> (lat, lon)
 
-        # V07B dataset name and axis order: (time, lat, lon)
-        if "precipitation" in grp:
-            ds_name = "precipitation"
-        elif "precipitationCal" in grp:
-            ds_name = "precipitationCal"   # V06 fallback
-        else:
-            log.error("No precipitation dataset in %s. Keys: %s", fpath.name, list(grp.keys()))
-            return None
+    arr = np.array(arr, dtype=np.float32, copy=True)
+    arr[arr < FILL_THRESHOLD] = np.nan
 
-        ds = grp[ds_name]
-        # Detect axis order from shape: V07B=(1,1800,3600), V06=(1,3600,1800)
-        if ds.shape[1] == 1800:
-            # V07B: (time, lat, lon) -> slice [0, lat_idx, lon_idx]
-            precip_raw = ds[0,
-                            lat_idx[0]:lat_idx[-1] + 1,
-                            lon_idx[0]:lon_idx[-1] + 1]  # (n_lat, n_lon)
-            axis_order = "time,lat,lon"
-        else:
-            # V06: (time, lon, lat) -> slice [0, lon_idx, lat_idx]
-            precip_raw = ds[0,
-                            lon_idx[0]:lon_idx[-1] + 1,
-                            lat_idx[0]:lat_idx[-1] + 1]  # (n_lon, n_lat)
-            axis_order = "time,lon,lat"
+    # Subset to bbox. Full granules are global; OPeNDAP subsets are already
+    # clipped, so this is a no-op for them.
+    lat_sel = np.where((lats > BBOX["lat_min"] + EPS)
+                       & (lats < BBOX["lat_max"] + RES - EPS))[0]
+    lon_sel = np.where((lons > BBOX["lon_min"] + EPS)
+                       & (lons < BBOX["lon_max"] + RES - EPS))[0]
+    if lat_sel.size == 0 or lon_sel.size == 0:
+        raise ValueError("no grid points inside configured bbox")
 
-        # Timestamp: GPM IMERG stores seconds since GPS epoch 1980-01-06 00:00:00 UTC
-        # (NOT Unix epoch 1970-01-01)
-        # GPM IMERG time = seconds since GPS epoch 1980-01-06 00:00:00 UTC
-        GPS_EPOCH = datetime(1980, 1, 6, 0, 0, 0)
-        t_sec = int(grp["time"][0])
-        ts = GPS_EPOCH + timedelta(seconds=t_sec)
+    arr = arr[np.ix_(lat_sel, lon_sel)]
+    lats, lons = lats[lat_sel], lons[lon_sel]
 
-        sub_lats = lats[lat_idx]
-        sub_lons = lons[lon_idx]
+    # Normalise orientation so every file stacks identically.
+    if lats.size > 1 and lats[0] > lats[-1]:
+        lats, arr = lats[::-1], arr[::-1, :]
+    if lons.size > 1 and lons[0] > lons[-1]:
+        lons, arr = lons[::-1], arr[:, ::-1]
 
-    # Build long-format DataFrame
-    if axis_order == "time,lat,lon":
-        # precip_raw shape: (n_lat, n_lon) — meshgrid to align
-        lat_grid, lon_grid = np.meshgrid(sub_lats, sub_lons, indexing="ij")
-    else:
-        # precip_raw shape: (n_lon, n_lat)
-        lon_grid, lat_grid = np.meshgrid(sub_lons, sub_lats, indexing="ij")
-
-    precip_vals = precip_raw.flatten().astype(np.float32)
-    precip_vals[precip_vals < -9000] = np.nan
-
-    df = pd.DataFrame({
-        "timestamp":    ts,
-        "latitude":     lat_grid.flatten().astype(np.float32),
-        "longitude":    lon_grid.flatten().astype(np.float32),
-        "precip_mm_hr": precip_vals,
-    })
-    return df
+    return arr, lats, lons
 
 
-def aggregate_to_3h(df_30min: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate 30-min IMERG records to 3-hourly accumulations (mm/3h).
-
-    IMERG precip_mm_hr is a rate; multiply by 0.5h to get mm per 30-min period,
-    then sum 6 consecutive 30-min periods -> mm per 3h.
-    """
-    df = df_30min.copy()
-    df["precip_mm_30min"] = df["precip_mm_hr"] * 0.5  # rate -> depth
-
-    # Floor timestamp to 3h bin
-    df["ts_3h"] = df["timestamp"].dt.floor("3h")
-
-    agg = (
-        df.groupby(["ts_3h", "latitude", "longitude"])["precip_mm_30min"]
-        .sum()
-        .reset_index()
-        .rename(columns={"ts_3h": "timestamp", "precip_mm_30min": "precip_3h_mm"})
-    )
-    agg["precip_3h_mm"] = agg["precip_3h_mm"].clip(lower=0)
-    return agg
+def quarantine(fpath: Path, reason: str) -> None:
+    """Move an unreadable file aside. Raw data is never deleted."""
+    QUARANTINE.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(fpath), str(QUARANTINE / fpath.name))
+        log.warning("  Quarantined %s (%s)", fpath.name, reason)
+    except Exception as exc:
+        log.error("  Could not quarantine %s: %s", fpath.name, exc)
 
 
 def build_environmental_grid_from_gpm(gpm_3h: pd.DataFrame) -> pd.DataFrame:
     """
-    Produce the full environmental_grid.parquet compatible with build_features.py.
-    Weather columns (temperature, humidity, pressure, soil_moisture) are set to NaN
-    since only GPM rainfall is available in this run. ERA5 can be merged later.
+    Produce environmental_grid.parquet compatible with build_features.py.
+    Weather columns stay NaN until ERA5 is merged in.
     """
     df = gpm_3h.copy()
-    df["temperature_2m_c"]   = np.nan
-    df["humidity_pct"]        = np.nan
-    df["pressure_hpa"]        = np.nan
-    df["soil_moisture_m3m3"]  = np.nan
-    df["data_source"]         = "GPM_IMERG_V07"
+    df["temperature_2m_c"] = np.nan
+    df["humidity_pct"] = np.nan
+    df["pressure_hpa"] = np.nan
+    df["soil_moisture_m3m3"] = np.nan
+    df["data_source"] = "GPM_IMERG_V07"
     return df
 
 
-def main():
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def collect_files():
+    nc4 = sorted(RAW_GPM.rglob("*.HDF5.nc4"))
+    full = sorted(RAW_GPM.rglob("*.HDF5"))
+    full_only = [f for f in full if not (f.parent / (f.name + ".nc4")).exists()]
+    files = [f for f in nc4 + full_only if QUARANTINE not in f.parents]
+    return sorted(files, key=lambda p: p.name), len(nc4), len(full_only)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true",
+                    help="inspect a sample of files and exit without writing")
+    ap.add_argument("--all-months", action="store_true",
+                    help="process every month, not just the monsoon months")
+    args = ap.parse_args(argv)
+
     log.info("=== process_gpm.py ===")
-
-    # Collect GPM files — OPeNDAP subsets (.HDF5.nc4) preferred, fall back to full HDF5
-    nc4_files  = sorted(RAW_GPM.rglob("*.HDF5.nc4"))
-    hdf5_files = sorted(RAW_GPM.rglob("*.HDF5"))
-    # Exclude any HDF5 that already has a nc4 subset (avoid duplicates)
-    hdf5_only  = [f for f in hdf5_files if not (f.parent / (f.name + ".nc4")).exists()]
-
-    all_files = nc4_files + hdf5_only
-    if not all_files:
-        log.error("No GPM files found in %s. Run download_data.py --source gpm first.", RAW_GPM)
-        return 1
-
-    log.info("Found %d GPM files (%d OPeNDAP subsets, %d full HDF5) in %s",
-             len(all_files), len(nc4_files), len(hdf5_only), RAW_GPM)
+    OUT.mkdir(parents=True, exist_ok=True)
 
     try:
-        import h5py
+        import h5py  # noqa: F401
     except ImportError:
         log.error("h5py not installed. Run: pip install h5py")
         return 1
 
-    # Parse each file
-    frames = []
-    lat_min, lat_max = BBOX["lat_min"], BBOX["lat_max"]
-    lon_min, lon_max = BBOX["lon_min"], BBOX["lon_max"]
+    all_files, n_nc4, n_full = collect_files()
+    if not all_files:
+        log.error("No GPM files in %s. Run download_data.py --source gpm first.", RAW_GPM)
+        return 1
+    log.info("Found %d files (%d OPeNDAP subsets, %d full granules)",
+             len(all_files), n_nc4, n_full)
+
+    if not args.all_months:
+        kept = []
+        for f in all_files:
+            try:
+                if timestamp_from_name(f).month in MONSOON_MONTHS:
+                    kept.append(f)
+            except ValueError:
+                kept.append(f)     # unparseable name: let the reader judge it
+        log.info("Monsoon filter (months %s): %d of %d files",
+                 sorted(MONSOON_MONTHS), len(kept), len(all_files))
+        all_files = kept
+
+    if args.dry_run:
+        log.info("--- DRY RUN: inspecting up to 5 files, writing nothing ---")
+        for f in all_files[:5]:
+            try:
+                arr, lats, lons = read_imerg(f)
+                log.info("  OK   %s | ts=%s | grid=%dx%d | valid=%.1f%% | max=%.2f mm/hr",
+                         f.name, timestamp_from_name(f), lats.size, lons.size,
+                         100 * np.isfinite(arr).mean(), float(np.nanmax(arr)))
+            except Exception as exc:
+                log.error("  FAIL %s: %s", f.name, exc)
+        return 0
+
+    # ---- Pass 1: read granules, accumulate directly into 3h bins ----------
+    # Accumulating here rather than collecting one DataFrame per file keeps
+    # peak memory at tens of MB instead of several GB across ~47k files.
+    sums, counts = {}, {}
+    ref_lats = ref_lons = None
+    n_lat = n_lon = 0
+    n_ok = n_bad = n_mismatch = 0
 
     for i, fpath in enumerate(all_files):
-        if i % 480 == 0:
-            log.info("  Parsing file %d/%d: %s", i + 1, len(all_files), fpath.name)
+        if i % 2000 == 0:
+            log.info("  [%d/%d] %s", i + 1, len(all_files), fpath.name)
         try:
-            if fpath.suffix == ".nc4":
-                df = parse_imerg_nc4(fpath)
-            else:
-                df = parse_imerg_hdf5(fpath, lat_min, lat_max, lon_min, lon_max)
-            if df is not None:
-                frames.append(df)
-        except Exception as e:
-            log.error("  Failed to parse %s: %s", fpath.name, e)
-            if fpath.exists():
-                fpath.unlink()
-                log.warning("  Deleted corrupt file: %s (will be re-downloaded)", fpath.name)
+            ts = timestamp_from_name(fpath)
+            arr, lats, lons = read_imerg(fpath)
+        except Exception as exc:
+            log.error("  Failed to parse %s: %s", fpath.name, exc)
+            quarantine(fpath, str(exc)[:80])
+            n_bad += 1
             continue
 
-    if not frames:
-        log.error("No data could be parsed from HDF5 files.")
+        if ref_lats is None:
+            ref_lats, ref_lons = lats, lons
+            n_lat, n_lon = lats.size, lons.size
+            log.info("  Reference grid: %d lat x %d lon | lat %.2f-%.2f | lon %.2f-%.2f",
+                     n_lat, n_lon, lats[0], lats[-1], lons[0], lons[-1])
+        elif arr.shape != (n_lat, n_lon):
+            log.error("  Grid mismatch in %s: %s vs (%d,%d)",
+                      fpath.name, arr.shape, n_lat, n_lon)
+            quarantine(fpath, "grid mismatch")
+            n_mismatch += 1
+            continue
+
+        bin_ts = pd.Timestamp(ts).floor("3h")
+        if bin_ts not in sums:
+            sums[bin_ts] = np.zeros((n_lat, n_lon), dtype=np.float64)
+            counts[bin_ts] = np.zeros((n_lat, n_lon), dtype=np.int16)
+        valid = np.isfinite(arr)
+        sums[bin_ts][valid] += arr[valid] * 0.5      # mm/hr over 30 min -> mm
+        counts[bin_ts][valid] += 1
+        n_ok += 1
+
+    log.info("Parsed %d granules OK | %d unreadable | %d grid mismatch",
+             n_ok, n_bad, n_mismatch)
+    if n_bad or n_mismatch:
+        log.warning("Quarantined files are in %s. Inspect them; "
+                    "do not assume they are corrupt.", QUARANTINE)
+    if not sums:
+        log.error("No granules could be read. Nothing written.")
         return 1
 
-    log.info("Parsed %d half-hourly frames. Concatenating...", len(frames))
-    df_30min = pd.concat(frames, ignore_index=True)
-    df_30min["timestamp"] = pd.to_datetime(df_30min["timestamp"])
+    # ---- Pass 2: bins -> long DataFrame ----------------------------------
+    bins = sorted(sums)
+    log.info("Building 3h frame: %d bins x %d cells = %d rows",
+             len(bins), n_lat * n_lon, len(bins) * n_lat * n_lon)
 
-    log.info("  30-min records: %d | time range: %s to %s",
-             len(df_30min), df_30min["timestamp"].min(), df_30min["timestamp"].max())
+    stack = np.empty((len(bins), n_lat, n_lon), dtype=np.float32)
+    obs = np.empty((len(bins), n_lat, n_lon), dtype=np.int16)
+    for k, b in enumerate(bins):
+        c = counts[b]
+        v = sums[b].astype(np.float32)
+        v[c == 0] = np.nan          # no observations -> NaN, not a fake zero
+        stack[k], obs[k] = v, c
 
-    # Save raw 30-min parquet
-    raw_out = OUT / "gpm_30min.parquet"
-    df_30min.to_parquet(raw_out, index=False)
-    log.info("  30-min parquet saved: %s (%.1f MB)", raw_out.name, raw_out.stat().st_size / 1e6)
+    lat_grid, lon_grid = np.meshgrid(ref_lats, ref_lons, indexing="ij")
+    n_cells = n_lat * n_lon
+    df_3h = pd.DataFrame({
+        "timestamp": np.repeat(np.array(bins, dtype="datetime64[ns]"), n_cells),
+        "latitude": np.tile(lat_grid.ravel().astype(np.float32), len(bins)),
+        "longitude": np.tile(lon_grid.ravel().astype(np.float32), len(bins)),
+        "precip_3h_mm": stack.reshape(-1),
+        "n_obs_3h": obs.reshape(-1),
+    })
+    df_3h["precip_3h_mm"] = df_3h["precip_3h_mm"].clip(lower=0)
 
-    # Aggregate to 3h
-    log.info("Aggregating to 3-hourly...")
-    df_3h = aggregate_to_3h(df_30min)
-    log.info("  3h records: %d | unique timestamps: %d | grid cells: %d",
-             len(df_3h),
-             df_3h["timestamp"].nunique(),
-             df_3h.groupby(["latitude", "longitude"]).ngroups)
-
-    # Save 3h rainfall parquet
     gpm_out = OUT / "gpm_rainfall.parquet"
     df_3h.to_parquet(gpm_out, index=False)
-    log.info("  GPM 3h parquet saved: %s (%.1f MB)", gpm_out.name, gpm_out.stat().st_size / 1e6)
+    log.info("  Saved %s (%.1f MB)", gpm_out.name, gpm_out.stat().st_size / 1e6)
 
-    # Build full environmental_grid (GPM rainfall + NaN weather columns)
-    env_df = build_environmental_grid_from_gpm(df_3h)
     env_out = OUT / "environmental_grid.parquet"
-    env_df.to_parquet(env_out, index=False)
-    log.info("  Environmental grid saved: %s (%.1f MB, %d rows)",
-             env_out.name, env_out.stat().st_size / 1e6, len(env_df))
+    build_environmental_grid_from_gpm(df_3h).to_parquet(env_out, index=False)
+    log.info("  Saved %s (%.1f MB, %d rows)",
+             env_out.name, env_out.stat().st_size / 1e6, len(df_3h))
 
-    # Quick sanity checks
+    # ---- Verification -----------------------------------------------------
     log.info("=== GPM DATA VERIFICATION ===")
-    log.info("  Time range     : %s  to  %s", df_3h["timestamp"].min(), df_3h["timestamp"].max())
-    log.info("  Lat range      : %.2f  to  %.2f", float(df_3h["latitude"].min()), float(df_3h["latitude"].max()))
-    log.info("  Lon range      : %.2f  to  %.2f", float(df_3h["longitude"].min()), float(df_3h["longitude"].max()))
-    log.info("  Precip min/mean/max: %.3f / %.3f / %.3f mm/3h",
+    log.info("  Time range : %s to %s", df_3h["timestamp"].min(), df_3h["timestamp"].max())
+    log.info("  Lat range  : %.2f to %.2f",
+             float(df_3h["latitude"].min()), float(df_3h["latitude"].max()))
+    log.info("  Lon range  : %.2f to %.2f",
+             float(df_3h["longitude"].min()), float(df_3h["longitude"].max()))
+    log.info("  Precip mm/3h min/mean/max : %.3f / %.3f / %.3f",
              float(df_3h["precip_3h_mm"].min()),
              float(df_3h["precip_3h_mm"].mean()),
              float(df_3h["precip_3h_mm"].max()))
-    log.info("  NaN precip rows: %d (%.2f%%)",
+    log.info("  Bins with all 6 granules  : %.1f%%",
+             100 * (df_3h["n_obs_3h"] == 6).mean())
+    log.info("  NaN precip rows           : %d (%.2f%%)",
              int(df_3h["precip_3h_mm"].isna().sum()),
              100 * df_3h["precip_3h_mm"].isna().mean())
-    log.info("  Data source    : GPM_IMERG_V07 (REAL)")
+
+    # Seasonal total per cell is the check that catches a units error.
+    season = df_3h.dropna(subset=["precip_3h_mm"]).copy()
+    season["year"] = season["timestamp"].dt.year
+    per_cell = season.groupby("year")["precip_3h_mm"].sum() / n_cells
+    log.info("  Seasonal rainfall per cell (expect ~1000-1200 mm for a full "
+             "Jun-Sep monsoon):")
+    for year, total in per_cell.items():
+        log.info("    %d : %7.1f mm", year, total)
 
     return 0
 
