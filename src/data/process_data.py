@@ -237,7 +237,16 @@ def process_era5():
             # Standardise time column name
             if "valid_time" in df.columns:
                 df = df.rename(columns={"valid_time": "time"})
-            df["time"] = pd.to_datetime(df["time"])
+            # Handle component time columns (year/month/day/hour dict-like)
+            if "time" in df.columns:
+                try:
+                    df["time"] = pd.to_datetime(df["time"])
+                except (ValueError, TypeError):
+                    # ERA5 sometimes stores time as cftime objects
+                    import cftime
+                    df["time"] = pd.to_datetime([
+                        str(t) for t in df["time"]
+                    ], errors="coerce")
             frames.append(df)
             log.info("ERA5 %s: %d rows, %s to %s",
                      label, len(df), df["time"].min(), df["time"].max())
@@ -547,6 +556,9 @@ def main():
             era5_sub = era5_sub.drop_duplicates(["timestamp", "latitude", "longitude"])
             env_df["latitude"]  = env_df["latitude"].round(1)
             env_df["longitude"] = env_df["longitude"].round(1)
+            env_df["latitude"]  = env_df["latitude"].round(1)
+            era5_sub["latitude"]  = era5_sub["latitude"].round(1)
+            era5_sub["longitude"] = era5_sub["longitude"].round(1)
             env_df = env_df.merge(era5_sub, on=["timestamp", "latitude", "longitude"], how="left")
             fill_pct = 100 * env_df["temperature_2m_c"].notna().mean() if "temperature_2m_c" in env_df.columns else 0
             log.info("ERA5 merge: temperature fill=%.1f%%", fill_pct)

@@ -113,7 +113,13 @@ def merge_labels(env_feat: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
 def merge_terrain(df: pd.DataFrame, terrain: pd.DataFrame) -> pd.DataFrame:
     log.info("Merging terrain features...")
     terrain_cols = ["latitude", "longitude", "elevation_m", "slope_deg", "aspect_deg", "terrain_ruggedness"]
-    merged = df.merge(terrain[terrain_cols], on=["latitude", "longitude"], how="left")
+    df = df.copy()
+    df["latitude"]  = df["latitude"].round(2).astype("float32")
+    df["longitude"] = df["longitude"].round(2).astype("float32")
+    terrain_sub = terrain[terrain_cols].copy()
+    terrain_sub["latitude"]  = terrain_sub["latitude"].round(2).astype("float32")
+    terrain_sub["longitude"] = terrain_sub["longitude"].round(2).astype("float32")
+    merged = df.merge(terrain_sub, on=["latitude", "longitude"], how="left")
 
     merged["flood_prone_terrain"] = (
         (merged["slope_deg"] > 15) & merged["elevation_m"].between(300, 3000)
