@@ -169,7 +169,7 @@ def build_event_cell_index(grid_coords: pd.DataFrame) -> dict:
     idx = {}
     for date_str, districts in FLASH_EVENTS:
         cells = district_cells(grid_coords, districts)
-        key_set = set(map(tuple, cells[["latitude", "longitude"]].round(3).values))
+        key_set = set(map(tuple, cells[["latitude", "longitude"]].astype(float).round(2).values))
         idx[date_str] = key_set
         log.info("  %s  districts=%s  -> %d cells",
                  date_str, districts, len(key_set))
@@ -226,8 +226,13 @@ def extract_seeds(
     (28.5, 28.6 ...) while GPM uses cell centres (28.55, 28.65 ...). Using
     terrain coords for the lookup produced zero matches.
     """
-    # Extract unique grid coords from master dataset itself
+    # Extract unique grid coords from master dataset.
+    # MUST cast float32->float64 and round before building the index.
+    # float32 stores 28.55 as 28.549999237060547; bbox comparisons
+    # against float64 boundaries then silently fail.
     grid_coords = df[["latitude", "longitude"]].drop_duplicates().copy()
+    grid_coords["latitude"]  = grid_coords["latitude"].astype(float).round(2)
+    grid_coords["longitude"] = grid_coords["longitude"].astype(float).round(2)
     log.info("Building district→cell index from %d master grid cells ...",
              len(grid_coords))
     event_cells = build_event_cell_index(grid_coords)
@@ -247,8 +252,8 @@ def extract_seeds(
 
         valid_cells = event_cells[date_str]
         day_rows["_cell"] = list(zip(
-            day_rows["latitude"].round(3),
-            day_rows["longitude"].round(3)
+            day_rows["latitude"].astype(float).round(2),
+            day_rows["longitude"].astype(float).round(2)
         ))
         spatial = day_rows[day_rows["_cell"].isin(valid_cells)].drop(columns="_cell")
         log.info("  %s: %d district cells → %d master rows kept as seeds",
