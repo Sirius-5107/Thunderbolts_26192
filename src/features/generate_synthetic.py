@@ -157,15 +157,19 @@ def district_cells(terrain: pd.DataFrame, district_names: list) -> pd.DataFrame:
     return terrain[mask][["latitude", "longitude"]]
 
 
-def build_event_cell_index(terrain: pd.DataFrame) -> dict:
+def build_event_cell_index(grid_coords: pd.DataFrame) -> dict:
     """
     For each flash event date, return the set of (lat, lon) tuples
     that fall in the documented districts.
+
+    grid_coords must have columns latitude, longitude with the SAME
+    coordinate values used in the master dataset (GPM cell centres:
+    28.55, 28.65 ... not terrain corners 28.5, 28.6 ...).
     """
     idx = {}
     for date_str, districts in FLASH_EVENTS:
-        cells = district_cells(terrain, districts)
-        key_set = set(map(tuple, cells[["latitude", "longitude"]].round(2).values))
+        cells = district_cells(grid_coords, districts)
+        key_set = set(map(tuple, cells[["latitude", "longitude"]].round(3).values))
         idx[date_str] = key_set
         log.info("  %s  districts=%s  -> %d cells",
                  date_str, districts, len(key_set))
@@ -216,9 +220,17 @@ def extract_seeds(
       1. Filter master_dataset to that date.
       2. Restrict to cells in the documented districts.
       3. Optionally skip years in exclude_years.
+
+    IMPORTANT: The district bbox lookup uses the master dataset's own unique
+    (lat, lon) pairs — NOT terrain coordinates. Terrain uses grid corners
+    (28.5, 28.6 ...) while GPM uses cell centres (28.55, 28.65 ...). Using
+    terrain coords for the lookup produced zero matches.
     """
-    log.info("Building district→cell index ...")
-    event_cells = build_event_cell_index(terrain)
+    # Extract unique grid coords from master dataset itself
+    grid_coords = df[["latitude", "longitude"]].drop_duplicates().copy()
+    log.info("Building district→cell index from %d master grid cells ...",
+             len(grid_coords))
+    event_cells = build_event_cell_index(grid_coords)
 
     seeds = []
     skipped_years = []
@@ -235,8 +247,8 @@ def extract_seeds(
 
         valid_cells = event_cells[date_str]
         day_rows["_cell"] = list(zip(
-            day_rows["latitude"].round(2),
-            day_rows["longitude"].round(2)
+            day_rows["latitude"].round(3),
+            day_rows["longitude"].round(3)
         ))
         spatial = day_rows[day_rows["_cell"].isin(valid_cells)].drop(columns="_cell")
         log.info("  %s: %d district cells → %d master rows kept as seeds",
